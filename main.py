@@ -1,4 +1,4 @@
-import os, time, requests, tempfile, subprocess, threading
+import os, time, threading, tempfile, subprocess, requests
 from flask import Flask
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -19,7 +19,7 @@ def read_last():
 
 def write_last(v):
     with open(LAST_FILE, "w", encoding="utf-8") as f:
-        f.write(v)
+            f.write(v)
 
 def latest_item():
     r = requests.get(RSS, timeout=15, headers={"User-Agent":"Mozilla/5.0"})
@@ -36,16 +36,26 @@ def latest_item():
     return link, title
 
 def tg_send_text(text):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     try:
-        requests.post(url, json={"chat_id": CHAT_ID, "text": text}, timeout=15)
+        requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={"chat_id": CHAT_ID, "text": text},
+            timeout=15
+        )
     except Exception:
         pass
 
 def tg_send_video(path, caption=""):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendVideo"
-    with open(path, "rb") as f:
-        requests.post(url, data={"chat_id": CHAT_ID, "caption": caption}, files={"video": f}, timeout=120)
+    try:
+        with open(path, "rb") as f:
+            requests.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendVideo",
+                data={"chat_id": CHAT_ID, "caption": caption},
+                files={"video": f},
+                timeout=180
+            )
+    except Exception:
+        raise
 
 def download_video(url):
     tmpdir = tempfile.mkdtemp()
@@ -56,11 +66,11 @@ def download_video(url):
         for name in os.listdir(tmpdir):
             if name.lower().endswith((".mp4", ".webm", ".mkv")):
                 return os.path.join(tmpdir, name)
-    except subprocess.CalledProcessError:
+    except Exception:
         return None
     return None
 
-def loop():
+def worker():
     tg_send_text(f"👋 Bot online. Watching @{USERNAME} every 60s.")
     last = read_last()
     while True:
@@ -84,14 +94,11 @@ def loop():
             pass
         time.sleep(60)
 
-# simple health endpoint so Render treats it as a web service
 @app.get("/")
 def health():
-    return "OK",
+    return "ok", 200, {"Content-Type": "text/plain; charset=utf-8"}
 
 if __name__ == "__main__":
-    # start background checker
-    threading.Thread(target=loop, daemon=True).start()
-    # start tiny web server (Render expects a listening port)
+    threading.Thread(target=worker, daemon=True).start()
     port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
