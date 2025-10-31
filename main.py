@@ -87,7 +87,7 @@ def loop():
 # simple health endpoint so Render treats it as a web service
 @app.get("/")
 def health():
-    return "OK", 200
+    return "OK",
 
 if __name__ == "__main__":
     # start background checker
