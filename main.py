@@ -1,11 +1,14 @@
-import os, time, requests, tempfile, subprocess
+import os, time, requests, tempfile, subprocess, threading
+from flask import Flask
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]           # from @BotFather
-CHAT_ID = os.environ["CHAT_ID"]               # your numeric ID
-USERNAME = os.environ["TIKTOK_USERNAME"]      # e.g. tokki.dva
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+CHAT_ID = os.environ["CHAT_ID"]
+USERNAME = os.environ["TIKTOK_USERNAME"]
 
 RSS = f"https://rsshub.app/tiktok/user/{USERNAME}"
 LAST_FILE = "last_id.txt"
+
+app = Flask(__name__)
 
 def read_last():
     try:
@@ -57,8 +60,8 @@ def download_video(url):
         return None
     return None
 
-if __name__ == "__main__":
-    tg_send_text("👋 Bot online. Watching every 60s.")
+def loop():
+    tg_send_text(f"👋 Bot online. Watching @{USERNAME} every 60s.")
     last = read_last()
     while True:
         try:
@@ -66,8 +69,8 @@ if __name__ == "__main__":
             if link:
                 vid_id = link.rstrip("/").split("/")[-1]
                 if vid_id and vid_id != last:
+                    caption = f"🎬 New video from @{USERNAME}\n{title}\nOriginal: {link}"
                     path = download_video(link)
-                    caption = f"🎬 New video\n{title}\nOriginal: {link}"
                     if path:
                         try:
                             tg_send_video(path, caption=caption)
@@ -80,3 +83,15 @@ if __name__ == "__main__":
         except Exception:
             pass
         time.sleep(60)
+
+# simple health endpoint so Render treats it as a web service
+@app.get("/")
+def health():
+    return "OK", 200
+
+if __name__ == "__main__":
+    # start background checker
+    threading.Thread(target=loop, daemon=True).start()
+    # start tiny web server (Render expects a listening port)
+    port = int(os.environ.get("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
