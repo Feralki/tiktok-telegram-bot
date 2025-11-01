@@ -1,15 +1,20 @@
-import os, time, threading, tempfile, subprocess, requests
-from flask import Flask
+import os, time, threading, tempfile, subprocess, json, requests
+from flask import Flask, request, jsonify
 
+# ====== CONFIG FROM ENV ======
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
-USERNAME = os.environ["TIKTOK_USERNAME"]
+USERNAME = os.environ["TIKTOK_USERNAME"]          # no @
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "secret") # for /check endpoint
 
-RSS = f"https://rsshub.app/tiktok/user/{USERNAME}"
-LAST_FILE = "last_id.txt"
+# ====== CONSTANTS ======
+LAST_FILE = "last_id.txt"          # remembers last seen video id
+CHECK_EVERY_SEC = 60               # minute polling
+CHECK_BATCH = 5                    # how many latest posts to inspect (backfill safety)
 
 app = Flask(__name__)
 
+# ---------- helpers ----------
 def read_last():
     try:
         with open(LAST_FILE, "r", encoding="utf-8") as f:
@@ -19,21 +24,7 @@ def read_last():
 
 def write_last(v):
     with open(LAST_FILE, "w", encoding="utf-8") as f:
-            f.write(v)
-
-def latest_item():
-    r = requests.get(RSS, timeout=15, headers={"User-Agent":"Mozilla/5.0"})
-    if r.status_code != 200 or not r.text:
-        return None, None
-    t = r.text
-    i = t.find("<item")
-    if i == -1:
-        return None, None
-    l1 = t.find("<link>", i); l2 = t.find("</link>", l1)
-    link = t[l1+6:l2].strip() if l1!=-1 and l2!=-1 else None
-    tt1 = t.find("<title>", i); tt2 = t.find("</title>", tt1)
-    title = t[tt1+7:tt2].strip() if tt1!=-1 and tt2!=-1 else ""
-    return link, title
+        f.write(v or "")
 
 def tg_send_text(text):
     try:
@@ -55,9 +46,13 @@ def tg_send_video(path, caption=""):
                 timeout=180
             )
     except Exception:
+        # if Telegram refuses (e.g., >50MB), at least send the link-only caption
         raise
 
 def download_video(url):
+    """
+    Download best mp4 with yt-dlp. Returns path or None.
+    """
     tmpdir = tempfile.mkdtemp()
     out = os.path.join(tmpdir, "%(id)s.%(ext)s")
     cmd = ["python3", "-m", "yt_dlp", "-o", out, "-f", "best[ext=mp4]/best", url]
@@ -70,34 +65,104 @@ def download_video(url):
         return None
     return None
 
-def worker():
-    tg_send_text(f"👋 Bot online. Watching @{USERNAME} every 60s.")
+def latest_items_via_ytdlp(username, n=CHECK_BATCH):
+    """
+    Query TikTok directly (no RSS). Returns up to n newest (url, title), newest-first.
+    Uses yt-dlp JSON dump (one JSON line per item) without downloading media.
+    """
+    url = f"https://www.tiktok.com/@{username}"
+    cmd = ["python3", "-m", "yt_dlp", "-j", "--playlist-end", str(n), url]
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=80, check=True)
+        items = []
+        for line in p.stdout.splitlines():
+            try:
+                o = json.loads(line)
+                vid_url = o.get("webpage_url") or o.get("url")
+                title = o.get("title") or ""
+                if vid_url:
+                    items.append((vid_url, title))
+            except json.JSONDecodeError:
+                continue
+        return items[:n]
+    except Exception as e:
+        tg_send_text(f"⚠️ yt-dlp error: {e}")
+        return []
+
+def process_once(verbose=False):
+    """
+    One detection+send pass.
+    - Looks at latest N posts
+    - Sends any unseen, oldest->newest
+    Returns a dict summary.
+    """
     last = read_last()
+    items = latest_items_via_ytdlp(USERNAME, n=CHECK_BATCH)
+
+    info = {"last_known": last, "found": len(items), "will_send": 0, "sent": 0}
+    if not items:
+        if verbose: tg_send_text("ℹ️ No items returned this pass.")
+        return info
+
+    def vid_id(u): return u.rstrip("/").split("/")[-1] if u else ""
+
+    # build list of unseen since 'last'
+    unseen = []
+    for link, title in items:
+        v = vid_id(link)
+        if last and v == last:
+            break
+        unseen.append((link, title, v))
+
+    # first time ever: only send the newest one to avoid spam
+    if not last and unseen:
+        unseen = unseen[:1]
+
+    info["will_send"] = len(unseen)
+
+    # send oldest->newest so chat order is natural
+    for link, title, v in reversed(unseen):
+        caption = f"🎬 New video from @{USERNAME}\n{title}\nOriginal: {link}"
+        path = download_video(link)
+        if path:
+            try:
+                tg_send_video(path, caption=caption)
+            except Exception:
+                tg_send_text(caption)  # fallback to link if Telegram rejects (size etc.)
+        else:
+            tg_send_text(caption)
+        write_last(v)
+        info["sent"] += 1
+        last = v
+
+    if verbose:
+        tg_send_text(f"ℹ️ Scan: found={info['found']}, will_send={info['will_send']}, sent={info['sent']}")
+    return info
+
+# ---------- background loop ----------
+def worker():
+    tg_send_text(f"👋 Bot online. Watching @{USERNAME} every {CHECK_EVERY_SEC}s.")
     while True:
         try:
-            link, title = latest_item()
-            if link:
-                vid_id = link.rstrip("/").split("/")[-1]
-                if vid_id and vid_id != last:
-                    caption = f"🎬 New video from @{USERNAME}\n{title}\nOriginal: {link}"
-                    path = download_video(link)
-                    if path:
-                        try:
-                            tg_send_video(path, caption=caption)
-                        except Exception:
-                            tg_send_text(caption)
-                    else:
-                        tg_send_text(caption)
-                    write_last(vid_id)
-                    last = vid_id
-        except Exception:
-            pass
-        time.sleep(60)
+            process_once(verbose=False)
+        except Exception as e:
+            tg_send_text(f"⚠️ worker error: {e}")
+        time.sleep(CHECK_EVERY_SEC)
 
+# ---------- web endpoints ----------
 @app.get("/")
 def health():
     return "ok", 200, {"Content-Type": "text/plain; charset=utf-8"}
 
+# Force a scan now from your browser: /check?key=ADMIN_KEY
+@app.get("/check")
+def check_now():
+    if request.args.get("key") != ADMIN_KEY:
+        return "forbidden", 403
+    info = process_once(verbose=True)
+    return jsonify(info)
+
+# ---------- main ----------
 if __name__ == "__main__":
     threading.Thread(target=worker, daemon=True).start()
     port = int(os.environ.get("PORT", "10000"))
