@@ -1,20 +1,20 @@
-import os, time, threading, tempfile, subprocess, json, requests
+import os, time, threading, tempfile, subprocess, json, requests, re, html
 from flask import Flask, request, jsonify
 
-# ====== CONFIG FROM ENV ======
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-CHAT_ID = os.environ["CHAT_ID"]
-USERNAME = os.environ["TIKTOK_USERNAME"]          # no @
-ADMIN_KEY = os.environ.get("ADMIN_KEY", "secret") # for /check endpoint
+# ========= CONFIG FROM ENV =========
+BOT_TOKEN = os.environ["BOT_TOKEN"]            # Telegram bot token
+CHAT_ID = os.environ["CHAT_ID"]                # Your chat id
+USERNAME = os.environ["TIKTOK_USERNAME"]       # TikTok handle (no @)
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "secret")  # for /check endpoint (optional)
 
-# ====== CONSTANTS ======
-LAST_FILE = "last_id.txt"          # remembers last seen video id
-CHECK_EVERY_SEC = 60               # minute polling
-CHECK_BATCH = 5                    # how many latest posts to inspect (backfill safety)
+# ========= CONSTANTS =========
+LAST_FILE = "last_id.txt"      # remembers last sent TikTok id between loops
+CHECK_EVERY_SEC = 60           # how often to check (seconds)
+CHECK_BATCH = 5                # how many recent posts to inspect/backfill
 
 app = Flask(__name__)
 
-# ---------- helpers ----------
+# ---------- small helpers ----------
 def read_last():
     try:
         with open(LAST_FILE, "r", encoding="utf-8") as f:
@@ -37,21 +37,17 @@ def tg_send_text(text):
         pass
 
 def tg_send_video(path, caption=""):
-    try:
-        with open(path, "rb") as f:
-            requests.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/sendVideo",
-                data={"chat_id": CHAT_ID, "caption": caption},
-                files={"video": f},
-                timeout=180
-            )
-    except Exception:
-        # if Telegram refuses (e.g., >50MB), at least send the link-only caption
-        raise
+    with open(path, "rb") as f:
+        requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendVideo",
+            data={"chat_id": CHAT_ID, "caption": caption},
+            files={"video": f},
+            timeout=180
+        )
 
 def download_video(url):
     """
-    Download best mp4 with yt-dlp. Returns path or None.
+    Download best mp4 with yt-dlp. Returns local path or None.
     """
     tmpdir = tempfile.mkdtemp()
     out = os.path.join(tmpdir, "%(id)s.%(ext)s")
@@ -65,13 +61,22 @@ def download_video(url):
         return None
     return None
 
+# ---------- detection (yt-dlp -> fallback) ----------
 def latest_items_via_ytdlp(username, n=CHECK_BATCH):
     """
-    Query TikTok directly (no RSS). Returns up to n newest (url, title), newest-first.
-    Uses yt-dlp JSON dump (one JSON line per item) without downloading media.
+    Primary path: ask TikTok via yt-dlp JSON (newest-first).
+    If this fails (exit 1, region lock, extractor issue), we fall back to a public JSON feed.
+    Returns list of (video_url, title), newest-first.
     """
     url = f"https://www.tiktok.com/@{username}"
-    cmd = ["python3", "-m", "yt_dlp", "-j", "--playlist-end", str(n), url]
+    cmd = [
+        "python3", "-m", "yt_dlp",
+        "-j", "--playlist-end", str(n),
+        "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/124.0 Safari/537.36",
+        url
+    ]
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=80, check=True)
         items = []
@@ -84,29 +89,63 @@ def latest_items_via_ytdlp(username, n=CHECK_BATCH):
                     items.append((vid_url, title))
             except json.JSONDecodeError:
                 continue
-        return items[:n]
+        if items:
+            return items[:n]
     except Exception as e:
-        tg_send_text(f"⚠️ yt-dlp error: {e}")
+        tg_send_text(f"⚠️ yt-dlp error (will fallback): {e}")
+
+    # fallback if listing failed
+    return fallback_latest_items(username, n=n)
+
+def fallback_latest_items(username, n=CHECK_BATCH):
+    """
+    Fallback: query a public feed and parse latest video links.
+    Uses tiktokapi.dev which returns JSON without auth.
+    Returns list of (video_url, title).
+    """
+    try:
+        r = requests.get(
+            f"https://tiktokapi.dev/api/feed/{username}",
+            timeout=20,
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        raw = data if isinstance(data, list) else data.get("data", [])
+        items = []
+        for it in raw:
+            link = it.get("url") or it.get("webpage_url") or it.get("share_url") or it.get("link")
+            title = it.get("title") or it.get("desc") or ""
+            if link:
+                items.append((link, title))
+            if len(items) >= n:
+                break
+        return items
+    except Exception:
         return []
 
+# ---------- one scan pass ----------
 def process_once(verbose=False):
     """
     One detection+send pass.
-    - Looks at latest N posts
+    - Gets latest items (yt-dlp, fallback if needed)
     - Sends any unseen, oldest->newest
-    Returns a dict summary.
+    Returns a summary dict.
     """
     last = read_last()
     items = latest_items_via_ytdlp(USERNAME, n=CHECK_BATCH)
 
     info = {"last_known": last, "found": len(items), "will_send": 0, "sent": 0}
     if not items:
-        if verbose: tg_send_text("ℹ️ No items returned this pass.")
+        if verbose:
+            tg_send_text("ℹ️ No items returned this pass.")
         return info
 
-    def vid_id(u): return u.rstrip("/").split("/")[-1] if u else ""
+    def vid_id(u): 
+        return u.rstrip("/").split("/")[-1] if u else ""
 
-    # build list of unseen since 'last'
+    # gather unseen since 'last'
     unseen = []
     for link, title in items:
         v = vid_id(link)
@@ -114,7 +153,7 @@ def process_once(verbose=False):
             break
         unseen.append((link, title, v))
 
-    # first time ever: only send the newest one to avoid spam
+    # first run: avoid spam (send only newest)
     if not last and unseen:
         unseen = unseen[:1]
 
@@ -128,7 +167,8 @@ def process_once(verbose=False):
             try:
                 tg_send_video(path, caption=caption)
             except Exception:
-                tg_send_text(caption)  # fallback to link if Telegram rejects (size etc.)
+                # if Telegram rejects (e.g., >50MB), at least send the link
+                tg_send_text(caption)
         else:
             tg_send_text(caption)
         write_last(v)
@@ -154,7 +194,7 @@ def worker():
 def health():
     return "ok", 200, {"Content-Type": "text/plain; charset=utf-8"}
 
-# Force a scan now from your browser: /check?key=ADMIN_KEY
+# Force a scan from your browser: /check?key=ADMIN_KEY
 @app.get("/check")
 def check_now():
     if request.args.get("key") != ADMIN_KEY:
