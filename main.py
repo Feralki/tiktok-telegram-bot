@@ -5,12 +5,14 @@ from flask import Flask, request, jsonify
 BOT_TOKEN = os.environ["BOT_TOKEN"]            # Telegram bot token
 CHAT_ID = os.environ["CHAT_ID"]                # Your Telegram chat ID
 USERNAME = os.environ["TIKTOK_USERNAME"]       # TikTok username (no @)
-ADMIN_KEY = os.environ.get("ADMIN_KEY", "secret")  # optional: for /check
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "secret")
 
 # ========= CONSTANTS =========
-LAST_FILE = "last_id.txt"      # remembers last sent TikTok ID
-CHECK_EVERY_SEC = 60           # how often to check (seconds)
-CHECK_BATCH = 5                # how many recent posts to scan
+LAST_FILE = "/var/data/last_id.txt"   # IMPORTANT: persistent storage
+os.makedirs("/var/data", exist_ok=True)
+
+CHECK_EVERY_SEC = 60
+CHECK_BATCH = 5
 
 app = Flask(__name__)
 
@@ -46,9 +48,6 @@ def tg_send_video(path, caption=""):
         )
 
 def download_video(url):
-    """
-    Download best mp4 with yt-dlp. Returns local path or None.
-    """
     tmpdir = tempfile.mkdtemp()
     out = os.path.join(tmpdir, "%(id)s.%(ext)s")
     cmd = ["python3", "-m", "yt_dlp", "-o", out, "-f", "best[ext=mp4]/best", url]
@@ -61,14 +60,10 @@ def download_video(url):
         return None
     return None
 
-# ---------- detection (yt-dlp -> fallback) ----------
+# ---------- detection ----------
 def latest_items_via_ytdlp(username, n=CHECK_BATCH):
-    """
-    Try to list newest TikToks via yt-dlp.
-    If that fails, silently fallback to API.
-    """
     url = f"https://www.tiktok.com/@{username}"
-    cmd = ["python3", "-m", "yt_dlp", "-j", "--playlist-end", str(n), "--user-agent", "Mozilla/5.0", url]
+    cmd = ["python3", "-m", "yt_dlp", "-j", "--playlist-end", str(n), url]
 
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=80, check=True)
@@ -82,102 +77,70 @@ def latest_items_via_ytdlp(username, n=CHECK_BATCH):
                     items.append((vid_url, title))
             except json.JSONDecodeError:
                 continue
-        if items:
-            return items[:n]
-    except Exception:
-        return fallback_latest_items(username, n=n)
-
-    return fallback_latest_items(username, n=n)
-
-def fallback_latest_items(username, n=CHECK_BATCH):
-    """
-    Fallback: use public JSON feed.
-    """
-    try:
-        r = requests.get(f"https://tiktokapi.dev/api/feed/{username}", timeout=20)
-        if r.status_code != 200:
-            return []
-        data = r.json()
-        raw = data if isinstance(data, list) else data.get("data", [])
-        items = []
-        for it in raw:
-            link = it.get("url") or it.get("share_url") or it.get("webpage_url") or it.get("link")
-            title = it.get("title") or it.get("desc") or ""
-            if link:
-                items.append((link, title))
-            if len(items) >= n:
-                break
-        return items
+        return items[:n]
     except Exception:
         return []
 
-# ---------- one full check ----------
-def process_once(verbose=False):
+# ---------- main logic ----------
+def process_once():
     last = read_last()
-    items = latest_items_via_ytdlp(USERNAME, n=CHECK_BATCH)
-
-    info = {"last_known": last, "found": len(items), "will_send": 0, "sent": 0}
-    if not items:
-        if verbose:
-            tg_send_text("ℹ️ No items returned this pass.")
-        return info
+    items = latest_items_via_ytdlp(USERNAME)
 
     def vid_id(u):
-        return u.rstrip("/").split("/")[-1] if u else ""
+        if not u:
+            return ""
+        u = u.split("?", 1)[0]
+        if "/video/" in u:
+            return u.split("/video/")[-1].split("/")[0]
+        return u.rstrip("/").split("/")[-1]
 
     unseen = []
     for link, title in items:
         v = vid_id(link)
+        if not v:
+            continue
         if last and v == last:
             break
         unseen.append((link, title, v))
 
     if not last and unseen:
-        unseen = unseen[:1]  # first run – send only latest
-
-    info["will_send"] = len(unseen)
+        unseen = unseen[:1]
 
     for link, title, v in reversed(unseen):
-        caption = f"🎬 New video from @{USERNAME}\n{title}\nOriginal: {link}"
+        caption = f"🎬 New video from @{USERNAME}\n{title}\n{link}"
         path = download_video(link)
         if path:
             try:
-                tg_send_video(path, caption=caption)
+                tg_send_video(path, caption)
             except Exception:
                 tg_send_text(caption)
         else:
             tg_send_text(caption)
         write_last(v)
-        info["sent"] += 1
-        last = v
-
-    if verbose:
-        tg_send_text(f"ℹ️ Scan: found={info['found']}, will_send={info['will_send']}, sent={info['sent']}")
-    return info
 
 # ---------- background loop ----------
 def worker():
-    tg_send_text(f"👋 Bot online. Watching @{USERNAME} every {CHECK_EVERY_SEC}s.")
+    tg_send_text(f"👋 Bot online. Watching @{USERNAME}.")
     while True:
         try:
-            process_once(verbose=False)
+            process_once()
         except Exception as e:
-            tg_send_text(f"⚠️ worker error: {e}")
+            tg_send_text(f"⚠️ Error: {e}")
         time.sleep(CHECK_EVERY_SEC)
 
-# ---------- web endpoints ----------
+# ---------- web ----------
 @app.get("/")
 def health():
-    return "ok", 200, {"Content-Type": "text/plain; charset=utf-8"}
+    return "ok"
 
 @app.get("/check")
-def check_now():
+def check():
     if request.args.get("key") != ADMIN_KEY:
         return "forbidden", 403
-    info = process_once(verbose=True)
-    return jsonify(info)
+    process_once()
+    return jsonify({"status": "ok"})
 
-# ---------- main ----------
+# ---------- start ----------
 if __name__ == "__main__":
     threading.Thread(target=worker, daemon=True).start()
     port = int(os.environ.get("PORT", "10000"))
