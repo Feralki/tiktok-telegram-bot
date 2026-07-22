@@ -9,6 +9,7 @@ ADMIN_KEY = os.environ.get("ADMIN_KEY", "secret")
 
 CHECK_EVERY_SEC = 60
 CHECK_BATCH = 8
+DELETE_CHECK_EVERY_SEC = 600  # how often to re-check old videos for deletion
 
 STATE_DIR = "/tmp/tiktok_bot_state"
 os.makedirs(STATE_DIR, exist_ok=True)
@@ -51,23 +52,28 @@ def download_video(url):
     return None
 
 # ---------- State ----------
+# state is now a list of dicts: {"id": str, "url": str, "deleted": bool}
 def state_file(username):
     return os.path.join(STATE_DIR, f"{username}_sent.json")
 
-def load_sent_ids(username):
+def load_state(username):
     with STATE_LOCK:
         try:
             with open(state_file(username), "r", encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
         except Exception:
             return []
+    # migrate old format (list of plain id strings) if present
+    if data and isinstance(data[0], str):
+        return [{"id": i, "url": "", "deleted": False} for i in data]
+    return data
 
-def save_sent_ids(username, ids_list):
+def save_state(username, items):
     with STATE_LOCK:
         try:
             tmp = state_file(username) + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(ids_list[-500:], f)
+                json.dump(items[-500:], f)
             os.replace(tmp, state_file(username))
         except Exception:
             pass
@@ -101,20 +107,27 @@ def latest_items(username):
     except Exception:
         return []
 
-# ---------- Process account ----------
+# ---------- Check if a single video still exists ----------
+def video_still_exists(url):
+    cmd = ["python3", "-m", "yt_dlp", "-j", "--user-agent", "Mozilla/5.0", url]
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        return p.returncode == 0
+    except Exception:
+        # network hiccup etc - don't assume deleted
+        return True
+
+# ---------- Process account (new videos) ----------
 def process_account(username):
-    sent_ids = load_sent_ids(username)
-    sent_set = set(sent_ids)
+    state = load_state(username)
+    sent_set = {it["id"] for it in state}
 
     items = latest_items(username)
 
-    new_items = []
-    for it in items:
-        if it["id"] not in sent_set:
-            new_items.append(it)
+    new_items = [it for it in items if it["id"] not in sent_set]
 
     # Stop spam on restart
-    if len(sent_ids) == 0 and len(new_items) > 1:
+    if len(state) == 0 and len(new_items) > 1:
         new_items = new_items[:1]
 
     for it in reversed(new_items):
@@ -126,19 +139,45 @@ def process_account(username):
         else:
             tg_send_text(caption)
 
-        sent_ids.append(it["id"])
+        state.append({"id": it["id"], "url": it["url"], "deleted": False})
 
-    save_sent_ids(username, sent_ids)
+    save_state(username, state)
+
+# ---------- Check account (deletions) ----------
+def check_deletions_for_account(username):
+    state = load_state(username)
+    changed = False
+
+    for it in state:
+        if it.get("deleted") or not it.get("url"):
+            continue
+        if not video_still_exists(it["url"]):
+            it["deleted"] = True
+            changed = True
+            tg_send_text(f"🗑️ Video deleted by @{username}\n{it['url']}")
+
+    if changed:
+        save_state(username, state)
 
 # ---------- Worker ----------
 def worker():
     tg_send_text(f"👋 Bot online. Watching: {', '.join('@'+u for u in USERNAMES)}")
+    last_delete_check = 0
     while True:
         for username in USERNAMES:
             try:
                 process_account(username)
             except Exception:
                 tg_send_text(f"⚠️ Error on @{username}")
+
+        if time.time() - last_delete_check >= DELETE_CHECK_EVERY_SEC:
+            for username in USERNAMES:
+                try:
+                    check_deletions_for_account(username)
+                except Exception:
+                    tg_send_text(f"⚠️ Error checking deletions for @{username}")
+            last_delete_check = time.time()
+
         time.sleep(CHECK_EVERY_SEC)
 
 # ---------- Web ----------
@@ -153,6 +192,14 @@ def check_now():
     for username in USERNAMES:
         process_account(username)
     return jsonify({"status": "checked"})
+
+@app.get("/check_deletions")
+def check_deletions_now():
+    if request.args.get("key") != ADMIN_KEY:
+        return "forbidden", 403
+    for username in USERNAMES:
+        check_deletions_for_account(username)
+    return jsonify({"status": "checked_deletions"})
 
 # ---------- Main ----------
 if __name__ == "__main__":
