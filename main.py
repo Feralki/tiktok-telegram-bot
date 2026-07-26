@@ -9,7 +9,8 @@ ADMIN_KEY = os.environ.get("ADMIN_KEY", "secret")
 
 CHECK_EVERY_SEC = 60
 CHECK_BATCH = 8
-DELETE_CHECK_EVERY_SEC = 600  # how often to re-check old videos for deletion
+DELETE_CHECK_EVERY_SEC = 600   # how often to re-check old videos for deletion
+DELETE_FAIL_THRESHOLD = 3      # must fail this many checks in a row before we call it deleted
 
 STATE_DIR = "/tmp/tiktok_bot_state"
 os.makedirs(STATE_DIR, exist_ok=True)
@@ -29,13 +30,16 @@ def tg_send_text(text):
         pass
 
 def tg_send_video(path, caption=""):
-    with open(path, "rb") as f:
-        requests.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendVideo",
-            data={"chat_id": CHAT_ID, "caption": caption},
-            files={"video": f},
-            timeout=180
-        )
+    try:
+        with open(path, "rb") as f:
+            requests.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendVideo",
+                data={"chat_id": CHAT_ID, "caption": caption},
+                files={"video": f},
+                timeout=180
+            )
+    except Exception:
+        pass
 
 # ---------- Download ----------
 def download_video(url):
@@ -43,7 +47,7 @@ def download_video(url):
     out = os.path.join(tmpdir, "%(id)s.%(ext)s")
     cmd = ["python3", "-m", "yt_dlp", "-o", out, "-f", "best[ext=mp4]/best", url]
     try:
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
         for name in os.listdir(tmpdir):
             if name.lower().endswith((".mp4", ".webm", ".mkv")):
                 return os.path.join(tmpdir, name)
@@ -52,7 +56,7 @@ def download_video(url):
     return None
 
 # ---------- State ----------
-# state is now a list of dicts: {"id": str, "url": str, "deleted": bool}
+# Each state entry: {"id": str, "url": str, "title": str, "deleted": bool, "fail_count": int}
 def state_file(username):
     return os.path.join(STATE_DIR, f"{username}_sent.json")
 
@@ -63,10 +67,25 @@ def load_state(username):
                 data = json.load(f)
         except Exception:
             return []
-    # migrate old format (list of plain id strings) if present
-    if data and isinstance(data[0], str):
-        return [{"id": i, "url": "", "deleted": False} for i in data]
-    return data
+
+    if not data:
+        return []
+
+    # migrate older formats to the current shape
+    migrated = []
+    for it in data:
+        if isinstance(it, str):
+            # oldest format: just an id string
+            migrated.append({"id": it, "url": "", "title": "", "deleted": False, "fail_count": 0})
+        else:
+            migrated.append({
+                "id": it.get("id"),
+                "url": it.get("url", ""),
+                "title": it.get("title", ""),
+                "deleted": it.get("deleted", False),
+                "fail_count": it.get("fail_count", 0),
+            })
+    return migrated
 
 def save_state(username, items):
     with STATE_LOCK:
@@ -89,7 +108,7 @@ def latest_items(username):
         for line in p.stdout.splitlines():
             try:
                 o = json.loads(line)
-            except:
+            except Exception:
                 continue
 
             vid_id = o.get("id")
@@ -114,7 +133,7 @@ def video_still_exists(url):
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         return p.returncode == 0
     except Exception:
-        # network hiccup etc - don't assume deleted
+        # network hiccup / timeout - don't assume deleted
         return True
 
 # ---------- Process account (new videos) ----------
@@ -123,10 +142,9 @@ def process_account(username):
     sent_set = {it["id"] for it in state}
 
     items = latest_items(username)
-
     new_items = [it for it in items if it["id"] not in sent_set]
 
-    # Stop spam on restart
+    # Stop spam on first-ever run
     if len(state) == 0 and len(new_items) > 1:
         new_items = new_items[:1]
 
@@ -139,7 +157,13 @@ def process_account(username):
         else:
             tg_send_text(caption)
 
-        state.append({"id": it["id"], "url": it["url"], "deleted": False})
+        state.append({
+            "id": it["id"],
+            "url": it["url"],
+            "title": it["title"],
+            "deleted": False,
+            "fail_count": 0,
+        })
 
     save_state(username, state)
 
@@ -151,10 +175,20 @@ def check_deletions_for_account(username):
     for it in state:
         if it.get("deleted") or not it.get("url"):
             continue
-        if not video_still_exists(it["url"]):
+
+        if video_still_exists(it["url"]):
+            if it.get("fail_count", 0) != 0:
+                it["fail_count"] = 0
+                changed = True
+            continue
+
+        it["fail_count"] = it.get("fail_count", 0) + 1
+        changed = True
+
+        if it["fail_count"] >= DELETE_FAIL_THRESHOLD:
             it["deleted"] = True
-            changed = True
-            tg_send_text(f"🗑️ Video deleted by @{username}\n{it['url']}")
+            title = it.get("title", "")
+            tg_send_text(f"🗑️ Video deleted by @{username}\n{title}\n{it['url']}")
 
     if changed:
         save_state(username, state)
