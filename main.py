@@ -9,8 +9,9 @@ ADMIN_KEY = os.environ.get("ADMIN_KEY", "secret")
 
 CHECK_EVERY_SEC = 60
 CHECK_BATCH = 8
-DELETE_CHECK_EVERY_SEC = 600   # how often to re-check old videos for deletion
-DELETE_FAIL_THRESHOLD = 3      # must fail this many checks in a row before we call it deleted
+DELETE_CHECK_EVERY_SEC = 600     # how often to re-check old videos for deletion
+DELETE_FAIL_THRESHOLD = 3        # fast path: consecutive "confirmed removed" messages
+UNKNOWN_FAIL_THRESHOLD = 30      # slow path: consecutive unexplained failures (~5 hrs) before we assume deleted anyway
 
 STATE_DIR = "/tmp/tiktok_bot_state"
 os.makedirs(STATE_DIR, exist_ok=True)
@@ -56,7 +57,7 @@ def download_video(url):
     return None
 
 # ---------- State ----------
-# Each state entry: {"id": str, "url": str, "title": str, "deleted": bool, "fail_count": int}
+# Each state entry: {"id": str, "url": str, "title": str, "deleted": bool, "fail_count": int, "unknown_count": int}
 def state_file(username):
     return os.path.join(STATE_DIR, f"{username}_sent.json")
 
@@ -76,7 +77,7 @@ def load_state(username):
     for it in data:
         if isinstance(it, str):
             # oldest format: just an id string
-            migrated.append({"id": it, "url": "", "title": "", "deleted": False, "fail_count": 0})
+            migrated.append({"id": it, "url": "", "title": "", "deleted": False, "fail_count": 0, "unknown_count": 0})
         else:
             migrated.append({
                 "id": it.get("id"),
@@ -84,6 +85,7 @@ def load_state(username):
                 "title": it.get("title", ""),
                 "deleted": it.get("deleted", False),
                 "fail_count": it.get("fail_count", 0),
+                "unknown_count": it.get("unknown_count", 0),
             })
     return migrated
 
@@ -127,14 +129,36 @@ def latest_items(username):
         return []
 
 # ---------- Check if a single video still exists ----------
+# Returns one of: "exists", "deleted", "unknown"
+# "unknown" covers rate-limits/blocks/network errors - never counts as deleted.
+REMOVED_PHRASES = [
+    "video currently unavailable",
+    "this post is unavailable",
+    "content isn't available",
+    "content unavailable",
+    "video not available",
+    "removed by the creator",
+    "user's account is private",  # only if you don't already skip private accounts
+]
+
 def video_still_exists(url):
     cmd = ["python3", "-m", "yt_dlp", "-j", "--user-agent", "Mozilla/5.0", url]
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        return p.returncode == 0
     except Exception:
-        # network hiccup / timeout - don't assume deleted
-        return True
+        return "unknown"  # timeout / crash - don't assume deleted
+
+    if p.returncode == 0:
+        return "exists"
+
+    err = (p.stderr or "").lower()
+
+    if any(phrase in err for phrase in REMOVED_PHRASES):
+        return "deleted"
+
+    # anything else (403, captcha, rate limit, empty response, unknown error)
+    # is NOT proof the video is gone - just that we got blocked this time
+    return "unknown"
 
 # ---------- Process account (new videos) ----------
 def process_account(username):
@@ -163,6 +187,7 @@ def process_account(username):
             "title": it["title"],
             "deleted": False,
             "fail_count": 0,
+            "unknown_count": 0,
         })
 
     save_state(username, state)
@@ -176,19 +201,36 @@ def check_deletions_for_account(username):
         if it.get("deleted") or not it.get("url"):
             continue
 
-        if video_still_exists(it["url"]):
-            if it.get("fail_count", 0) != 0:
+        result = video_still_exists(it["url"])
+
+        if result == "exists":
+            if it.get("fail_count", 0) != 0 or it.get("unknown_count", 0) != 0:
                 it["fail_count"] = 0
+                it["unknown_count"] = 0
                 changed = True
             continue
 
-        it["fail_count"] = it.get("fail_count", 0) + 1
-        changed = True
+        if result == "deleted":
+            # fast path: yt_dlp explicitly told us it's gone
+            it["fail_count"] = it.get("fail_count", 0) + 1
+            changed = True
+            if it["fail_count"] >= DELETE_FAIL_THRESHOLD:
+                it["deleted"] = True
+                title = it.get("title", "")
+                tg_send_text(f"🗑️ Video deleted by @{username}\n{title}\n{it['url']}")
+            continue
 
-        if it["fail_count"] >= DELETE_FAIL_THRESHOLD:
+        # result == "unknown": blocked/rate-limited/timeout/unrecognized error
+        # not proof of deletion on its own, but if it NEVER resolves, we still
+        # want to eventually tell the user rather than staying silent forever
+        it["unknown_count"] = it.get("unknown_count", 0) + 1
+        changed = True
+        if it["unknown_count"] >= UNKNOWN_FAIL_THRESHOLD:
             it["deleted"] = True
             title = it.get("title", "")
-            tg_send_text(f"🗑️ Video deleted by @{username}\n{title}\n{it['url']}")
+            tg_send_text(
+                f"🗑️ Video likely deleted by @{username} (unconfirmed - repeated errors, not a direct removal message)\n{title}\n{it['url']}"
+            )
 
     if changed:
         save_state(username, state)
