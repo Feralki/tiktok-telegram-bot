@@ -12,6 +12,8 @@ CHECK_BATCH = 8
 DELETE_CHECK_EVERY_SEC = 600     # how often to re-check old videos for deletion
 DELETE_FAIL_THRESHOLD = 3        # fast path: consecutive "confirmed removed" messages
 UNKNOWN_FAIL_THRESHOLD = 30      # slow path: consecutive unexplained failures (~5 hrs) before we assume deleted anyway
+DELETE_CHECK_MAX_PER_CYCLE = 5   # only check this many videos per account per cycle, to avoid hammering TikTok
+DELETE_CHECK_DELAY_SEC = 3       # pause between each individual video check
 
 STATE_DIR = "/tmp/tiktok_bot_state"
 os.makedirs(STATE_DIR, exist_ok=True)
@@ -46,7 +48,7 @@ def tg_send_video(path, caption=""):
 def download_video(url):
     tmpdir = tempfile.mkdtemp()
     out = os.path.join(tmpdir, "%(id)s.%(ext)s")
-    cmd = ["python3", "-m", "yt_dlp", "-o", out, "-f", "best[ext=mp4]/best", url]
+    cmd = ["python3", "-m", "yt_dlp", "-o", out, "-f", "best[ext=mp4]/best", "--user-agent", "Mozilla/5.0", url]
     try:
         subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
         for name in os.listdir(tmpdir):
@@ -197,10 +199,11 @@ def check_deletions_for_account(username):
     state = load_state(username)
     changed = False
 
-    for it in state:
-        if it.get("deleted") or not it.get("url"):
-            continue
+    # only look at videos not yet marked deleted, and only check a handful per cycle
+    to_check = [it for it in state if not it.get("deleted") and it.get("url")]
+    to_check = to_check[:DELETE_CHECK_MAX_PER_CYCLE]
 
+    for it in to_check:
         result = video_still_exists(it["url"])
 
         if result == "exists":
