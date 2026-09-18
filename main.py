@@ -7,12 +7,11 @@ CHAT_ID = os.environ["CHAT_ID"]
 USERNAMES = [u.strip().lstrip("@") for u in os.environ["TIKTOK_USERNAMES"].split(",") if u.strip()]
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "secret")
 
-CHECK_EVERY_SEC = 60
+CHECK_EVERY_SEC = 40
 CHECK_BATCH = 8
 DELETE_CHECK_EVERY_SEC = 600     # how often to re-check old videos for deletion
 DELETE_FAIL_THRESHOLD = 3        # fast path: consecutive "confirmed removed" messages
 UNKNOWN_FAIL_THRESHOLD = 30      # slow path: consecutive unexplained failures (~5 hrs) before we assume deleted anyway
-DELETE_CHECK_MAX_PER_CYCLE = 5   # only check this many videos per account per cycle, to avoid hammering TikTok
 DELETE_CHECK_DELAY_SEC = 3       # pause between each individual video check
 
 STATE_DIR = "/tmp/tiktok_bot_state"
@@ -29,33 +28,81 @@ def tg_send_text(text):
             json={"chat_id": CHAT_ID, "text": text, "disable_web_page_preview": True},
             timeout=15
         )
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"tg_send_text failed: {e}")
 
-def tg_send_video(path, caption=""):
+TG_SEND_VIDEO_ATTEMPTS = 3
+TG_SEND_VIDEO_RETRY_DELAY_SEC = 5
+
+def _try_send_video_once(path, caption):
     try:
         with open(path, "rb") as f:
-            requests.post(
+            r = requests.post(
                 f"https://api.telegram.org/bot{BOT_TOKEN}/sendVideo",
                 data={"chat_id": CHAT_ID, "caption": caption},
                 files={"video": f},
                 timeout=180
             )
-    except Exception:
-        pass
+        if r.status_code != 200:
+            print(f"tg_send_video non-200 response: {r.status_code} {r.text}")
+            return False
+        return True
+    except Exception as e:
+        print(f"tg_send_video failed: {e}")
+        return False
+
+def tg_send_video(path, caption=""):
+    # Retry the upload itself a few times - a lot of "failures" here are just
+    # transient network hiccups, not the video being unsendable.
+    for attempt in range(1, TG_SEND_VIDEO_ATTEMPTS + 1):
+        if _try_send_video_once(path, caption):
+            return True
+        if attempt < TG_SEND_VIDEO_ATTEMPTS:
+            time.sleep(TG_SEND_VIDEO_RETRY_DELAY_SEC)
+    return False
 
 # ---------- Download ----------
-def download_video(url):
+# Multiple format fallbacks - some videos aren't available in "best[ext=mp4]/best"
+# depending on region/CDN quirks, so we try progressively looser formats.
+DOWNLOAD_FORMATS = [
+    "best[ext=mp4]/best",
+    "best",
+    "worst[ext=mp4]/worst",
+]
+DOWNLOAD_ATTEMPTS_PER_FORMAT = 2
+DOWNLOAD_RETRY_DELAY_SEC = 5
+
+def _try_download_once(url, fmt, timeout):
     tmpdir = tempfile.mkdtemp()
     out = os.path.join(tmpdir, "%(id)s.%(ext)s")
-    cmd = ["python3", "-m", "yt_dlp", "-o", out, "-f", "best[ext=mp4]/best", "--user-agent", "Mozilla/5.0", url]
+    cmd = ["python3", "-m", "yt_dlp", "-o", out, "-f", fmt, "--user-agent", "Mozilla/5.0", url]
     try:
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        if result.returncode != 0:
+            print(f"yt-dlp download failed for {url} with format '{fmt}' (exit {result.returncode}):\n{result.stderr}")
+            return None
         for name in os.listdir(tmpdir):
             if name.lower().endswith((".mp4", ".webm", ".mkv")):
                 return os.path.join(tmpdir, name)
-    except Exception:
+        print(f"yt-dlp reported success but no video file found for {url} with format '{fmt}'")
         return None
+    except subprocess.TimeoutExpired:
+        print(f"download_video timed out for {url} with format '{fmt}'")
+        return None
+    except Exception as e:
+        print(f"download_video exception for {url} with format '{fmt}': {e}")
+        return None
+
+def download_video(url):
+    # Try every format, and retry each one a couple times before moving on -
+    # this is the main defense against ever falling back to a link-only message.
+    for fmt in DOWNLOAD_FORMATS:
+        for attempt in range(1, DOWNLOAD_ATTEMPTS_PER_FORMAT + 1):
+            path = _try_download_once(url, fmt, timeout=120)
+            if path:
+                return path
+            if attempt < DOWNLOAD_ATTEMPTS_PER_FORMAT:
+                time.sleep(DOWNLOAD_RETRY_DELAY_SEC)
     return None
 
 # ---------- State ----------
@@ -98,8 +145,8 @@ def save_state(username, items):
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(items[-500:], f)
             os.replace(tmp, state_file(username))
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"save_state failed for {username}: {e}")
 
 # ---------- Get videos ----------
 def latest_items(username):
@@ -107,7 +154,11 @@ def latest_items(username):
     cmd = ["python3", "-m", "yt_dlp", "-j", "--playlist-end", str(CHECK_BATCH), "--user-agent", "Mozilla/5.0", url]
 
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=80, check=True)
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=80)
+        if p.returncode != 0:
+            print(f"latest_items failed for @{username} (exit {p.returncode}):\n{p.stderr}")
+            return []
+
         items = []
         for line in p.stdout.splitlines():
             try:
@@ -127,7 +178,8 @@ def latest_items(username):
                 })
 
         return items
-    except Exception:
+    except Exception as e:
+        print(f"latest_items exception for @{username}: {e}")
         return []
 
 # ---------- Check if a single video still exists ----------
@@ -147,7 +199,8 @@ def video_still_exists(url):
     cmd = ["python3", "-m", "yt_dlp", "-j", "--user-agent", "Mozilla/5.0", url]
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-    except Exception:
+    except Exception as e:
+        print(f"video_still_exists exception for {url}: {e}")
         return "unknown"  # timeout / crash - don't assume deleted
 
     if p.returncode == 0:
@@ -160,6 +213,7 @@ def video_still_exists(url):
 
     # anything else (403, captcha, rate limit, empty response, unknown error)
     # is NOT proof the video is gone - just that we got blocked this time
+    print(f"video_still_exists unknown result for {url}:\n{p.stderr}")
     return "unknown"
 
 # ---------- Process account (new videos) ----------
@@ -178,9 +232,11 @@ def process_account(username):
         caption = f"🎬 New video from @{username}\n{it['title']}\n{it['url']}"
         path = download_video(it["url"])
 
+        sent_ok = False
         if path:
-            tg_send_video(path, caption)
-        else:
+            sent_ok = tg_send_video(path, caption)
+
+        if not sent_ok:
             tg_send_text(caption)
 
         state.append({
@@ -199,11 +255,16 @@ def check_deletions_for_account(username):
     state = load_state(username)
     changed = False
 
-    # only look at videos not yet marked deleted, and only check a handful per cycle
-    to_check = [it for it in state if not it.get("deleted") and it.get("url")]
-    to_check = to_check[:DELETE_CHECK_MAX_PER_CYCLE]
+    # check EVERY video not yet marked deleted, every cycle, forever -
+    # same idea as how new-video polling never stops watching an account.
+    # Newest first just so fresh uploads get confirmed sooner in the logs.
+    candidates = [it for it in state if not it.get("deleted") and it.get("url")]
+    to_check = list(reversed(candidates))
 
-    for it in to_check:
+    for i, it in enumerate(to_check):
+        if i > 0:
+            time.sleep(DELETE_CHECK_DELAY_SEC)
+
         result = video_still_exists(it["url"])
 
         if result == "exists":
@@ -246,14 +307,16 @@ def worker():
         for username in USERNAMES:
             try:
                 process_account(username)
-            except Exception:
+            except Exception as e:
+                print(f"process_account crashed for @{username}: {e}")
                 tg_send_text(f"⚠️ Error on @{username}")
 
         if time.time() - last_delete_check >= DELETE_CHECK_EVERY_SEC:
             for username in USERNAMES:
                 try:
                     check_deletions_for_account(username)
-                except Exception:
+                except Exception as e:
+                    print(f"check_deletions_for_account crashed for @{username}: {e}")
                     tg_send_text(f"⚠️ Error checking deletions for @{username}")
             last_delete_check = time.time()
 
