@@ -1,4 +1,5 @@
 import os, time, threading, tempfile, subprocess, json, requests
+from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, request, jsonify
 
 # ========= CONFIG =========
@@ -7,7 +8,7 @@ CHAT_ID = os.environ["CHAT_ID"]
 USERNAMES = [u.strip().lstrip("@") for u in os.environ["TIKTOK_USERNAMES"].split(",") if u.strip()]
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "secret")
 
-CHECK_EVERY_SEC = 40
+CHECK_EVERY_SEC = 60
 CHECK_BATCH = 8
 DELETE_CHECK_EVERY_SEC = 600     # how often to re-check old videos for deletion
 DELETE_FAIL_THRESHOLD = 3        # fast path: consecutive "confirmed removed" messages
@@ -19,6 +20,39 @@ os.makedirs(STATE_DIR, exist_ok=True)
 
 app = Flask(__name__)
 STATE_LOCK = threading.Lock()
+
+# Accounts are checked in parallel so one slow account never delays the others.
+ACCOUNT_EXECUTOR = ThreadPoolExecutor(max_workers=max(len(USERNAMES), 1))
+# Downloads/uploads happen in the background - detection never waits on them.
+DOWNLOAD_EXECUTOR = ThreadPoolExecutor(max_workers=8)
+
+# ---------- Rate-limit warning (cooldown so we don't spam Telegram) ----------
+RATE_LIMIT_WARNING_COOLDOWN_SEC = 600  # only send this warning once per 10 min max
+RATE_LIMIT_PHRASES = [
+    "429",
+    "rate limit",
+    "too many requests",
+    "captcha",
+    "403",
+    "forbidden",
+    "blocked",
+]
+_last_rate_limit_warning = {"ts": 0}
+_rate_limit_lock = threading.Lock()
+
+def maybe_warn_rate_limited(context, stderr_text):
+    err = (stderr_text or "").lower()
+    if not any(phrase in err for phrase in RATE_LIMIT_PHRASES):
+        return
+    with _rate_limit_lock:
+        now = time.time()
+        if now - _last_rate_limit_warning["ts"] < RATE_LIMIT_WARNING_COOLDOWN_SEC:
+            return
+        _last_rate_limit_warning["ts"] = now
+    tg_send_text(
+        f"⚠️ Looks like TikTok may be rate-limiting/blocking the bot ({context}). "
+        f"New videos and deletion checks may be delayed until this clears."
+    )
 
 # ---------- Telegram ----------
 def tg_send_text(text):
@@ -62,15 +96,16 @@ def tg_send_video(path, caption=""):
     return False
 
 # ---------- Download ----------
-# Multiple format fallbacks - some videos aren't available in "best[ext=mp4]/best"
-# depending on region/CDN quirks, so we try progressively looser formats.
+# We have a ~3 min time budget, so it's worth retrying properly rather than
+# giving up fast - this is the main defense against ever sending just a link.
 DOWNLOAD_FORMATS = [
     "best[ext=mp4]/best",
     "best",
     "worst[ext=mp4]/worst",
 ]
 DOWNLOAD_ATTEMPTS_PER_FORMAT = 2
-DOWNLOAD_RETRY_DELAY_SEC = 5
+DOWNLOAD_TIMEOUT_SEC = 20
+DOWNLOAD_RETRY_DELAY_SEC = 3
 
 def _try_download_once(url, fmt, timeout):
     tmpdir = tempfile.mkdtemp()
@@ -80,6 +115,7 @@ def _try_download_once(url, fmt, timeout):
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         if result.returncode != 0:
             print(f"yt-dlp download failed for {url} with format '{fmt}' (exit {result.returncode}):\n{result.stderr}")
+            maybe_warn_rate_limited(f"downloading {url}", result.stderr)
             return None
         for name in os.listdir(tmpdir):
             if name.lower().endswith((".mp4", ".webm", ".mkv")):
@@ -94,11 +130,9 @@ def _try_download_once(url, fmt, timeout):
         return None
 
 def download_video(url):
-    # Try every format, and retry each one a couple times before moving on -
-    # this is the main defense against ever falling back to a link-only message.
     for fmt in DOWNLOAD_FORMATS:
         for attempt in range(1, DOWNLOAD_ATTEMPTS_PER_FORMAT + 1):
-            path = _try_download_once(url, fmt, timeout=120)
+            path = _try_download_once(url, fmt, timeout=DOWNLOAD_TIMEOUT_SEC)
             if path:
                 return path
             if attempt < DOWNLOAD_ATTEMPTS_PER_FORMAT:
@@ -154,9 +188,10 @@ def latest_items(username):
     cmd = ["python3", "-m", "yt_dlp", "-j", "--playlist-end", str(CHECK_BATCH), "--user-agent", "Mozilla/5.0", url]
 
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=80)
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         if p.returncode != 0:
             print(f"latest_items failed for @{username} (exit {p.returncode}):\n{p.stderr}")
+            maybe_warn_rate_limited(f"fetching @{username}'s videos", p.stderr)
             return []
 
         items = []
@@ -214,9 +249,23 @@ def video_still_exists(url):
     # anything else (403, captcha, rate limit, empty response, unknown error)
     # is NOT proof the video is gone - just that we got blocked this time
     print(f"video_still_exists unknown result for {url}:\n{p.stderr}")
+    maybe_warn_rate_limited(f"checking if {url} still exists", p.stderr)
     return "unknown"
 
 # ---------- Process account (new videos) ----------
+def handle_new_video(username, item):
+    # Runs in the background - a slow download/upload here never delays
+    # detection of the next video, on this account or any other.
+    caption = f"🎬 New video from @{username}\n{item['title']}\n{item['url']}"
+    path = download_video(item["url"])
+
+    sent_ok = False
+    if path:
+        sent_ok = tg_send_video(path, caption)
+
+    if not sent_ok:
+        tg_send_text(caption)
+
 def process_account(username):
     state = load_state(username)
     sent_set = {it["id"] for it in state}
@@ -228,17 +277,13 @@ def process_account(username):
     if len(state) == 0 and len(new_items) > 1:
         new_items = new_items[:1]
 
+    if not new_items:
+        return
+
+    # Record every new video's ID immediately (so nothing gets re-detected
+    # or double-sent), THEN hand the slow part (download/upload) to the
+    # background pool and move on right away.
     for it in reversed(new_items):
-        caption = f"🎬 New video from @{username}\n{it['title']}\n{it['url']}"
-        path = download_video(it["url"])
-
-        sent_ok = False
-        if path:
-            sent_ok = tg_send_video(path, caption)
-
-        if not sent_ok:
-            tg_send_text(caption)
-
         state.append({
             "id": it["id"],
             "url": it["url"],
@@ -247,8 +292,10 @@ def process_account(username):
             "fail_count": 0,
             "unknown_count": 0,
         })
-
     save_state(username, state)
+
+    for it in reversed(new_items):
+        DOWNLOAD_EXECUTOR.submit(handle_new_video, username, it)
 
 # ---------- Check account (deletions) ----------
 def check_deletions_for_account(username):
@@ -304,17 +351,21 @@ def worker():
     tg_send_text(f"👋 Bot online. Watching: {', '.join('@'+u for u in USERNAMES)}")
     last_delete_check = 0
     while True:
-        for username in USERNAMES:
+        # Check every account in parallel - a slow/stuck account no longer
+        # delays how quickly the others get checked.
+        futures = [ACCOUNT_EXECUTOR.submit(process_account, u) for u in USERNAMES]
+        for f, username in zip(futures, USERNAMES):
             try:
-                process_account(username)
+                f.result()
             except Exception as e:
                 print(f"process_account crashed for @{username}: {e}")
                 tg_send_text(f"⚠️ Error on @{username}")
 
         if time.time() - last_delete_check >= DELETE_CHECK_EVERY_SEC:
-            for username in USERNAMES:
+            del_futures = [ACCOUNT_EXECUTOR.submit(check_deletions_for_account, u) for u in USERNAMES]
+            for f, username in zip(del_futures, USERNAMES):
                 try:
-                    check_deletions_for_account(username)
+                    f.result()
                 except Exception as e:
                     print(f"check_deletions_for_account crashed for @{username}: {e}")
                     tg_send_text(f"⚠️ Error checking deletions for @{username}")
