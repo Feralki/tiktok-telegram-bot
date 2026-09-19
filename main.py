@@ -26,10 +26,12 @@ os.makedirs(STATE_DIR, exist_ok=True)
 app = Flask(__name__)
 STATE_LOCK = threading.Lock()
 
-# Accounts are checked in parallel so one slow account never delays the others.
-ACCOUNT_EXECUTOR = ThreadPoolExecutor(max_workers=max(len(USERNAMES), 1))
-# Downloads/uploads happen in the background - detection never waits on them.
-DOWNLOAD_EXECUTOR = ThreadPoolExecutor(max_workers=8)
+# Accounts are checked with LIMITED concurrency - free-tier Render only has a
+# sliver of CPU, so running all accounts at once starves every subprocess and
+# makes everything time out together. A small pool queues them sensibly instead.
+ACCOUNT_EXECUTOR = ThreadPoolExecutor(max_workers=3)
+# Same reasoning for downloads - keep this small too.
+DOWNLOAD_EXECUTOR = ThreadPoolExecutor(max_workers=2)
 
 # ---------- Rate-limit warning (cooldown so we don't spam Telegram) ----------
 RATE_LIMIT_WARNING_COOLDOWN_SEC = 600  # only send this warning once per 10 min max
@@ -395,6 +397,9 @@ def worker():
                 u for u in USERNAMES
                 if u in PRIORITY_USERNAMES or cycle % NORMAL_ACCOUNT_CYCLE_SKIP == 0
             ]
+            # Submit priority accounts FIRST so they claim a worker slot
+            # immediately instead of queuing behind non-priority ones.
+            to_check_this_cycle.sort(key=lambda u: 0 if u in PRIORITY_USERNAMES else 1)
         else:
             to_check_this_cycle = USERNAMES
 
