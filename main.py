@@ -10,10 +10,10 @@ USERNAMES = [u.strip().lstrip("@") for u in os.environ["TIKTOK_USERNAMES"].split
 PRIORITY_USERNAMES = set(
     u.strip().lstrip("@") for u in os.environ.get("PRIORITY_USERNAMES", "").split(",") if u.strip()
 )
-NORMAL_ACCOUNT_CYCLE_SKIP = 3  # non-priority accounts only checked every Nth cycle
+NORMAL_ACCOUNT_CYCLE_SKIP = 4  # non-priority accounts checked every ~80s (20s x 4)
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "secret")
 
-CHECK_EVERY_SEC = 60
+CHECK_EVERY_SEC = 20
 CHECK_BATCH = 8
 DELETE_CHECK_EVERY_SEC = 600     # how often to re-check old videos for deletion
 DELETE_FAIL_THRESHOLD = 3        # fast path: consecutive "confirmed removed" messages
@@ -57,6 +57,35 @@ def maybe_warn_rate_limited(context, stderr_text):
     tg_send_text(
         f"⚠️ Looks like TikTok may be rate-limiting/blocking the bot ({context}). "
         f"New videos and deletion checks may be delayed until this clears."
+    )
+
+# ---------- Account-issue warning (separate from rate-limiting - this one usually needs YOU to check) ----------
+ACCOUNT_ISSUE_PHRASES = [
+    "account is either private or has embedding disabled",
+    "unable to extract secondary user id",
+    "user not found",
+    "unable to find user",
+    "this account is private",
+    "doesn't exist",
+]
+ACCOUNT_ISSUE_WARNING_COOLDOWN_SEC = 3600  # once per hour per account, not every cycle
+_account_issue_warnings = {}
+_account_issue_lock = threading.Lock()
+
+def maybe_warn_account_issue(username, stderr_text):
+    err = (stderr_text or "").lower()
+    if not any(phrase in err for phrase in ACCOUNT_ISSUE_PHRASES):
+        return
+    with _account_issue_lock:
+        now = time.time()
+        last = _account_issue_warnings.get(username, 0)
+        if now - last < ACCOUNT_ISSUE_WARNING_COOLDOWN_SEC:
+            return
+        _account_issue_warnings[username] = now
+    tg_send_text(
+        f"🚨 @{username} keeps failing in a way that looks permanent (private account, "
+        f"wrong username, or banned) - not just a temporary block. Worth checking this "
+        f"account manually, since retrying alone probably won't fix it."
     )
 
 # ---------- Telegram ----------
@@ -197,6 +226,7 @@ def latest_items(username):
         if p.returncode != 0:
             print(f"latest_items failed for @{username} (exit {p.returncode}):\n{p.stderr}")
             maybe_warn_rate_limited(f"fetching @{username}'s videos", p.stderr)
+            maybe_warn_account_issue(username, p.stderr)
             return []
 
         items = []
