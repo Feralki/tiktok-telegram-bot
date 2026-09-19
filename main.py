@@ -6,6 +6,11 @@ from flask import Flask, request, jsonify
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
 USERNAMES = [u.strip().lstrip("@") for u in os.environ["TIKTOK_USERNAMES"].split(",") if u.strip()]
+# Optional: comma-separated subset of USERNAMES to check more often than the rest.
+PRIORITY_USERNAMES = set(
+    u.strip().lstrip("@") for u in os.environ.get("PRIORITY_USERNAMES", "").split(",") if u.strip()
+)
+NORMAL_ACCOUNT_CYCLE_SKIP = 3  # non-priority accounts only checked every Nth cycle
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "secret")
 
 CHECK_EVERY_SEC = 60
@@ -350,11 +355,21 @@ def check_deletions_for_account(username):
 def worker():
     tg_send_text(f"👋 Bot online. Watching: {', '.join('@'+u for u in USERNAMES)}")
     last_delete_check = 0
+    cycle = 0
     while True:
-        # Check every account in parallel - a slow/stuck account no longer
-        # delays how quickly the others get checked.
-        futures = [ACCOUNT_EXECUTOR.submit(process_account, u) for u in USERNAMES]
-        for f, username in zip(futures, USERNAMES):
+        # Priority accounts get checked every cycle. Everyone else only gets
+        # checked every NORMAL_ACCOUNT_CYCLE_SKIP cycles, so the priority
+        # account(s) get faster detection without raising total request volume.
+        if PRIORITY_USERNAMES:
+            to_check_this_cycle = [
+                u for u in USERNAMES
+                if u in PRIORITY_USERNAMES or cycle % NORMAL_ACCOUNT_CYCLE_SKIP == 0
+            ]
+        else:
+            to_check_this_cycle = USERNAMES
+
+        futures = [ACCOUNT_EXECUTOR.submit(process_account, u) for u in to_check_this_cycle]
+        for f, username in zip(futures, to_check_this_cycle):
             try:
                 f.result()
             except Exception as e:
@@ -371,6 +386,7 @@ def worker():
                     tg_send_text(f"⚠️ Error checking deletions for @{username}")
             last_delete_check = time.time()
 
+        cycle += 1
         time.sleep(CHECK_EVERY_SEC)
 
 # ---------- Web ----------
