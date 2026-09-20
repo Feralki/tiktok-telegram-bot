@@ -24,7 +24,7 @@ requirements.txt should contain:
   requests
   yt-dlp
 
-Render start command must be:  python bot.py
+Render start command must be:  python main.py
 (not gunicorn, or the background workers never start)
 """
 
@@ -989,8 +989,11 @@ def deletion_worker():
 def account_worker(username):
     print(f"[worker] started for @{username}", flush=True)
 
-    # Small stagger so all accounts don't fire at the same instant.
-    time.sleep(USERNAMES.index(username) * 0.5)
+    # Spread the accounts evenly across the check interval so they
+    # don't all queue for yt-dlp at the same moment.
+    time.sleep(
+        USERNAMES.index(username) * CHECK_EVERY_SEC / len(USERNAMES)
+    )
 
     next_check = time.time()
 
