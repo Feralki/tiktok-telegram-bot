@@ -43,12 +43,41 @@ def tg_send_text(text):
 TG_SEND_VIDEO_ATTEMPTS = 3
 TG_SEND_VIDEO_RETRY_DELAY_SEC = 5
 
+def _get_video_metadata(path):
+    # Telegram's in-app player streams smoother when it knows duration/
+    # width/height upfront instead of figuring it out while playing -
+    # that's very likely why saved files play fine but in-chat playback stutters.
+    cmd = [
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=width,height",
+        "-show_entries", "format=duration",
+        "-of", "json", path
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        if result.returncode != 0:
+            print(f"ffprobe failed for {path}: {result.stderr}")
+            return {}
+        data = json.loads(result.stdout)
+        meta = {}
+        if data.get("streams"):
+            meta["width"] = data["streams"][0].get("width")
+            meta["height"] = data["streams"][0].get("height")
+        if data.get("format", {}).get("duration"):
+            meta["duration"] = int(float(data["format"]["duration"]))
+        return {k: v for k, v in meta.items() if v}
+    except Exception as e:
+        print(f"ffprobe exception for {path}: {e}")
+        return {}
+
 def _try_send_video_once(path, caption):
     try:
+        data = {"chat_id": CHAT_ID, "caption": caption, "supports_streaming": True}
+        data.update(_get_video_metadata(path))
         with open(path, "rb") as f:
             r = requests.post(
                 f"https://api.telegram.org/bot{BOT_TOKEN}/sendVideo",
-                data={"chat_id": CHAT_ID, "caption": caption, "supports_streaming": True},
+                data=data,
                 files={"video": f},
                 timeout=180
             )
@@ -341,25 +370,37 @@ def worker():
     tg_send_text(f"👋 Bot online. Watching: {', '.join('@'+u for u in USERNAMES)}")
     last_delete_check = 0
     while True:
-        # Check accounts with limited concurrency (3 at a time) - fast without
-        # overloading the free-tier server like checking all of them at once did.
-        futures = [ACCOUNT_EXECUTOR.submit(process_account, u) for u in USERNAMES]
-        for f, username in zip(futures, USERNAMES):
-            try:
-                f.result()
-            except Exception as e:
-                print(f"process_account crashed for @{username}: {e}")
-                tg_send_text(f"⚠️ Error on @{username}")
-
-        if time.time() - last_delete_check >= DELETE_CHECK_EVERY_SEC:
-            del_futures = [ACCOUNT_EXECUTOR.submit(check_deletions_for_account, u) for u in USERNAMES]
-            for f, username in zip(del_futures, USERNAMES):
+        try:
+            # Check accounts with limited concurrency (4 at a time) - fast without
+            # overloading the free-tier server like checking all of them at once did.
+            futures = [ACCOUNT_EXECUTOR.submit(process_account, u) for u in USERNAMES]
+            for f, username in zip(futures, USERNAMES):
                 try:
                     f.result()
                 except Exception as e:
-                    print(f"check_deletions_for_account crashed for @{username}: {e}")
-                    tg_send_text(f"⚠️ Error checking deletions for @{username}")
-            last_delete_check = time.time()
+                    print(f"process_account crashed for @{username}: {e}")
+                    tg_send_text(f"⚠️ Error on @{username}")
+
+            if time.time() - last_delete_check >= DELETE_CHECK_EVERY_SEC:
+                del_futures = [ACCOUNT_EXECUTOR.submit(check_deletions_for_account, u) for u in USERNAMES]
+                for f, username in zip(del_futures, USERNAMES):
+                    try:
+                        f.result()
+                    except Exception as e:
+                        print(f"check_deletions_for_account crashed for @{username}: {e}")
+                        tg_send_text(f"⚠️ Error checking deletions for @{username}")
+                last_delete_check = time.time()
+        except Exception as e:
+            # This is the critical safety net: WHATEVER goes wrong here, the
+            # loop must never die. Without this, one unexpected error kills
+            # the entire background thread permanently while the web server
+            # keeps responding fine - making it look like nothing's wrong
+            # from the outside while checks silently stop forever.
+            print(f"worker loop crashed unexpectedly: {e}")
+            try:
+                tg_send_text(f"🚨 Bot's background loop hit an unexpected error and almost died, but recovered: {e}")
+            except Exception:
+                pass
 
         time.sleep(CHECK_EVERY_SEC)
 
