@@ -6,14 +6,9 @@ from flask import Flask, request, jsonify
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
 USERNAMES = [u.strip().lstrip("@") for u in os.environ["TIKTOK_USERNAMES"].split(",") if u.strip()]
-# Optional: comma-separated subset of USERNAMES to check more often than the rest.
-PRIORITY_USERNAMES = set(
-    u.strip().lstrip("@") for u in os.environ.get("PRIORITY_USERNAMES", "").split(",") if u.strip()
-)
-NORMAL_ACCOUNT_CYCLE_SKIP = 4  # non-priority accounts checked every ~80s (20s x 4)
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "secret")
 
-CHECK_EVERY_SEC = 20
+CHECK_EVERY_SEC = 40
 CHECK_BATCH = 8
 DELETE_CHECK_EVERY_SEC = 600     # how often to re-check old videos for deletion
 DELETE_FAIL_THRESHOLD = 3        # fast path: consecutive "confirmed removed" messages
@@ -29,66 +24,10 @@ STATE_LOCK = threading.Lock()
 # Accounts are checked with LIMITED concurrency - free-tier Render only has a
 # sliver of CPU, so running all accounts at once starves every subprocess and
 # makes everything time out together. A small pool queues them sensibly instead.
-ACCOUNT_EXECUTOR = ThreadPoolExecutor(max_workers=3)
-# Same reasoning for downloads - keep this small too.
+ACCOUNT_EXECUTOR = ThreadPoolExecutor(max_workers=4)
+# Downloads/uploads happen in the background so a slow one never delays
+# detecting the next new video.
 DOWNLOAD_EXECUTOR = ThreadPoolExecutor(max_workers=2)
-
-# ---------- Rate-limit warning (cooldown so we don't spam Telegram) ----------
-RATE_LIMIT_WARNING_COOLDOWN_SEC = 600  # only send this warning once per 10 min max
-RATE_LIMIT_PHRASES = [
-    "429",
-    "rate limit",
-    "too many requests",
-    "captcha",
-    "403",
-    "forbidden",
-    "blocked",
-]
-_last_rate_limit_warning = {"ts": 0}
-_rate_limit_lock = threading.Lock()
-
-def maybe_warn_rate_limited(context, stderr_text):
-    err = (stderr_text or "").lower()
-    if not any(phrase in err for phrase in RATE_LIMIT_PHRASES):
-        return
-    with _rate_limit_lock:
-        now = time.time()
-        if now - _last_rate_limit_warning["ts"] < RATE_LIMIT_WARNING_COOLDOWN_SEC:
-            return
-        _last_rate_limit_warning["ts"] = now
-    tg_send_text(
-        f"⚠️ Looks like TikTok may be rate-limiting/blocking the bot ({context}). "
-        f"New videos and deletion checks may be delayed until this clears."
-    )
-
-# ---------- Account-issue warning (separate from rate-limiting - this one usually needs YOU to check) ----------
-ACCOUNT_ISSUE_PHRASES = [
-    "account is either private or has embedding disabled",
-    "unable to extract secondary user id",
-    "user not found",
-    "unable to find user",
-    "this account is private",
-    "doesn't exist",
-]
-ACCOUNT_ISSUE_WARNING_COOLDOWN_SEC = 3600  # once per hour per account, not every cycle
-_account_issue_warnings = {}
-_account_issue_lock = threading.Lock()
-
-def maybe_warn_account_issue(username, stderr_text):
-    err = (stderr_text or "").lower()
-    if not any(phrase in err for phrase in ACCOUNT_ISSUE_PHRASES):
-        return
-    with _account_issue_lock:
-        now = time.time()
-        last = _account_issue_warnings.get(username, 0)
-        if now - last < ACCOUNT_ISSUE_WARNING_COOLDOWN_SEC:
-            return
-        _account_issue_warnings[username] = now
-    tg_send_text(
-        f"🚨 @{username} keeps failing in a way that looks permanent (private account, "
-        f"wrong username, or banned) - not just a temporary block. Worth checking this "
-        f"account manually, since retrying alone probably won't fix it."
-    )
 
 # ---------- Telegram ----------
 def tg_send_text(text):
@@ -137,10 +76,9 @@ def tg_send_video(path, caption=""):
 DOWNLOAD_FORMATS = [
     "best[ext=mp4]/best",
     "best",
-    "worst[ext=mp4]/worst",
 ]
 DOWNLOAD_ATTEMPTS_PER_FORMAT = 2
-DOWNLOAD_TIMEOUT_SEC = 20
+DOWNLOAD_TIMEOUT_SEC = 30
 DOWNLOAD_RETRY_DELAY_SEC = 3
 
 def _try_download_once(url, fmt, timeout):
@@ -151,7 +89,6 @@ def _try_download_once(url, fmt, timeout):
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         if result.returncode != 0:
             print(f"yt-dlp download failed for {url} with format '{fmt}' (exit {result.returncode}):\n{result.stderr}")
-            maybe_warn_rate_limited(f"downloading {url}", result.stderr)
             return None
         for name in os.listdir(tmpdir):
             if name.lower().endswith((".mp4", ".webm", ".mkv")):
@@ -224,11 +161,9 @@ def latest_items(username):
     cmd = ["python3", "-m", "yt_dlp", "-j", "--playlist-end", str(CHECK_BATCH), "--user-agent", "Mozilla/5.0", url]
 
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         if p.returncode != 0:
             print(f"latest_items failed for @{username} (exit {p.returncode}):\n{p.stderr}")
-            maybe_warn_rate_limited(f"fetching @{username}'s videos", p.stderr)
-            maybe_warn_account_issue(username, p.stderr)
             return []
 
         items = []
@@ -286,7 +221,6 @@ def video_still_exists(url):
     # anything else (403, captcha, rate limit, empty response, unknown error)
     # is NOT proof the video is gone - just that we got blocked this time
     print(f"video_still_exists unknown result for {url}:\n{p.stderr}")
-    maybe_warn_rate_limited(f"checking if {url} still exists", p.stderr)
     return "unknown"
 
 # ---------- Process account (new videos) ----------
@@ -301,7 +235,9 @@ def handle_new_video(username, item):
         sent_ok = tg_send_video(path, caption)
 
     if not sent_ok:
-        tg_send_text(caption)
+        # This is the ONLY warning-like message the bot sends now - couldn't
+        # actually get the video file, here's the link instead.
+        tg_send_text(f"⚠️ Couldn't download the video, here's the link instead:\n{caption}")
 
 def process_account(username):
     state = load_state(username)
@@ -387,24 +323,11 @@ def check_deletions_for_account(username):
 def worker():
     tg_send_text(f"👋 Bot online. Watching: {', '.join('@'+u for u in USERNAMES)}")
     last_delete_check = 0
-    cycle = 0
     while True:
-        # Priority accounts get checked every cycle. Everyone else only gets
-        # checked every NORMAL_ACCOUNT_CYCLE_SKIP cycles, so the priority
-        # account(s) get faster detection without raising total request volume.
-        if PRIORITY_USERNAMES:
-            to_check_this_cycle = [
-                u for u in USERNAMES
-                if u in PRIORITY_USERNAMES or cycle % NORMAL_ACCOUNT_CYCLE_SKIP == 0
-            ]
-            # Submit priority accounts FIRST so they claim a worker slot
-            # immediately instead of queuing behind non-priority ones.
-            to_check_this_cycle.sort(key=lambda u: 0 if u in PRIORITY_USERNAMES else 1)
-        else:
-            to_check_this_cycle = USERNAMES
-
-        futures = [ACCOUNT_EXECUTOR.submit(process_account, u) for u in to_check_this_cycle]
-        for f, username in zip(futures, to_check_this_cycle):
+        # Check accounts with limited concurrency (3 at a time) - fast without
+        # overloading the free-tier server like checking all of them at once did.
+        futures = [ACCOUNT_EXECUTOR.submit(process_account, u) for u in USERNAMES]
+        for f, username in zip(futures, USERNAMES):
             try:
                 f.result()
             except Exception as e:
@@ -421,7 +344,6 @@ def worker():
                     tg_send_text(f"⚠️ Error checking deletions for @{username}")
             last_delete_check = time.time()
 
-        cycle += 1
         time.sleep(CHECK_EVERY_SEC)
 
 # ---------- Web ----------
