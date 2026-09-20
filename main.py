@@ -28,7 +28,29 @@ USERNAMES = [
 
 # Normal TikTok checking
 CHECK_EVERY_SEC = 60
-CHECK_BATCH = 20
+
+# Lowered from 20 back down: at 20 items, yt-dlp checks for
+# several accounts were landing right at the old 80s timeout
+# and getting skipped entirely for that cycle. 12 is still
+# comfortably more than enough to never miss a burst of posts
+# within a single 60s check interval, and finishes faster.
+CHECK_BATCH = 12
+
+# How long a single account's "list latest videos" check is
+# allowed to take. This used to be a hardcoded 80 inside
+# latest_items() - now it's a named constant with real
+# headroom, since real-world checks were observed taking
+# 76-80s with CHECK_BATCH = 20 and timing out at 80s.
+ACCOUNT_CHECK_TIMEOUT_SEC = 120
+
+# If a single check finds more "new" videos than this, it is
+# almost certainly backlog catching up after earlier checks
+# failed/timed out for that account - not a real burst of
+# fresh posts. Only announce/deliver the most recent
+# MAX_NEW_ITEMS_PER_CYCLE of them; the rest are silently
+# recorded as already-seen so they are never announced late
+# and never counted as new again.
+MAX_NEW_ITEMS_PER_CYCLE = 3
 
 # Delivery
 DOWNLOAD_WORKERS = 2
@@ -39,11 +61,24 @@ UPLOAD_WORKERS = 2
 DOWNLOAD_TIMEOUT_SEC = 60
 DOWNLOAD_ATTEMPTS_PER_JOB = 2
 
+# How long delivery_job will wait for a download_video call
+# submitted to DOWNLOAD_EXECUTOR - covering BOTH time spent
+# queued behind other jobs (only DOWNLOAD_WORKERS run at once)
+# and the download itself. Generous on purpose: the actual
+# work is already self-bounded by DOWNLOAD_TIMEOUT_SEC inside
+# download_video, so this is a safety net against a truly
+# stuck worker, not a race against queue position.
+DOWNLOAD_QUEUE_WAIT_TIMEOUT_SEC = 300
+
 UPLOAD_TIMEOUT_SEC = 180
 UPLOAD_ATTEMPTS_PER_JOB = 2
 
 DELIVERY_RETRY_DELAY_SEC = 30
 DELIVERY_RETRY_SCAN_SEC = 30
+
+# Same reasoning as DOWNLOAD_QUEUE_WAIT_TIMEOUT_SEC, but for
+# UPLOAD_EXECUTOR / UPLOAD_WORKERS.
+UPLOAD_QUEUE_WAIT_TIMEOUT_SEC = 300
 
 # Deletion checking
 DELETE_CHECK_EVERY_SEC = 600
@@ -417,7 +452,7 @@ def latest_items(username):
             cmd,
             capture_output=True,
             text=True,
-            timeout=80,
+            timeout=ACCOUNT_CHECK_TIMEOUT_SEC,
             check=True,
         )
 
@@ -726,8 +761,19 @@ def delivery_job(username, video_id):
 
             try:
 
+                # NOTE: this timeout must cover both the time
+                # spent waiting for a free DOWNLOAD_WORKERS
+                # slot AND the actual download. download_video
+                # already self-bounds its own work via
+                # DOWNLOAD_TIMEOUT_SEC internally, so this
+                # outer wait is a generous safety net rather
+                # than a tight race - if it were too tight,
+                # a job that's merely waiting in queue behind
+                # other jobs (e.g. after a burst of new videos)
+                # would get marked "failed" before it ever got
+                # to run, then requeue and repeat forever.
                 path = download_future.result(
-                    timeout=DOWNLOAD_TIMEOUT_SEC + 5
+                    timeout=DOWNLOAD_QUEUE_WAIT_TIMEOUT_SEC
                 )
 
             except Exception as e:
@@ -914,7 +960,7 @@ def delivery_job(username, video_id):
             try:
 
                 uploaded = upload_future.result(
-                    timeout=UPLOAD_TIMEOUT_SEC + 5
+                    timeout=UPLOAD_QUEUE_WAIT_TIMEOUT_SEC
                 )
 
             except Exception as e:
@@ -1154,14 +1200,79 @@ def process_account(username):
                 if item["id"] not in sent_ids
             ]
 
-            # On a completely new account, don't suddenly
-            # send the entire backlog.
-            if (
-                len(state) == 0
-                and len(new_items) > 1
-            ):
+            # ------------------------------------------------
+            # Guard against announcing a whole backlog at
+            # once.
+            #
+            # This covers BOTH:
+            #   - a completely new account (state empty)
+            #   - an account that failed/timed out for
+            #     several cycles and then suddenly succeeds,
+            #     making many older videos look "new" all at
+            #     once.
+            #
+            # Anything beyond MAX_NEW_ITEMS_PER_CYCLE is
+            # silently recorded as already delivered
+            # (video_sent=True) so it is never announced late
+            # and never re-evaluated as new again.
+            # ------------------------------------------------
 
-                new_items = new_items[:1]
+            if len(new_items) > MAX_NEW_ITEMS_PER_CYCLE:
+
+                overflow = new_items[
+                    MAX_NEW_ITEMS_PER_CYCLE:
+                ]
+
+                new_items = new_items[
+                    :MAX_NEW_ITEMS_PER_CYCLE
+                ]
+
+                print(
+                    f"[new] @{username}: "
+                    f"{len(overflow) + len(new_items)} "
+                    f"items appeared new at once "
+                    f"(likely backlog from earlier failed "
+                    f"checks); announcing only the "
+                    f"{len(new_items)} most recent and "
+                    f"silently recording the rest",
+                    flush=True,
+                )
+
+                existing_ids = {
+                    entry.get("id")
+                    for entry in state
+                }
+
+                overflow_changed = False
+
+                for item in overflow:
+
+                    if item["id"] not in existing_ids:
+
+                        state.append({
+                            "id": item["id"],
+                            "url": item["url"],
+                            "title": item["title"],
+                            "deleted": False,
+                            "fail_count": 0,
+                            "unknown_count": 0,
+
+                            # Suppress delivery: treat as
+                            # already handled.
+                            "video_sent": True,
+
+                            "delivery_retry_after": 0,
+                            "last_delete_check": time.time(),
+                        })
+
+                        overflow_changed = True
+
+                if overflow_changed:
+
+                    _save_state_unlocked(
+                        username,
+                        state,
+                    )
 
         # ----------------------------------------------------
         # Send links immediately.
