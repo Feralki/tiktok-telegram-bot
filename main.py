@@ -48,7 +48,7 @@ def _try_send_video_once(path, caption):
         with open(path, "rb") as f:
             r = requests.post(
                 f"https://api.telegram.org/bot{BOT_TOKEN}/sendVideo",
-                data={"chat_id": CHAT_ID, "caption": caption},
+                data={"chat_id": CHAT_ID, "caption": caption, "supports_streaming": True},
                 files={"video": f},
                 timeout=180
             )
@@ -107,10 +107,27 @@ def download_video(url):
         for attempt in range(1, DOWNLOAD_ATTEMPTS_PER_FORMAT + 1):
             path = _try_download_once(url, fmt, timeout=DOWNLOAD_TIMEOUT_SEC)
             if path:
-                return path
+                return _make_streamable(path)
             if attempt < DOWNLOAD_ATTEMPTS_PER_FORMAT:
                 time.sleep(DOWNLOAD_RETRY_DELAY_SEC)
     return None
+
+def _make_streamable(path):
+    # Moves the video's metadata to the front of the file (faststart) so
+    # Telegram can play it smoothly while it loads, instead of stuttering.
+    # This is very fast (no re-encoding, just repositioning metadata).
+    fixed_path = path + "_fixed.mp4"
+    cmd = ["ffmpeg", "-y", "-i", path, "-c", "copy", "-movflags", "+faststart", fixed_path]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode == 0 and os.path.exists(fixed_path):
+            return fixed_path
+        print(f"ffmpeg faststart failed for {path} (exit {result.returncode}):\n{result.stderr}")
+    except Exception as e:
+        print(f"ffmpeg faststart exception for {path}: {e}")
+    # If ffmpeg fails for any reason, fall back to the original file rather
+    # than losing the video entirely.
+    return path
 
 # ---------- State ----------
 # Each state entry: {"id": str, "url": str, "title": str, "deleted": bool, "fail_count": int, "unknown_count": int}
