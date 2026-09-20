@@ -1,13 +1,15 @@
 import os
 import time
-import json
-import shutil
+import threading
 import tempfile
 import subprocess
-import threading
+import json
+import requests
+import shutil
+import hmac
+
 from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, request, jsonify
-import requests
 
 
 # ============================================================
@@ -16,6 +18,7 @@ import requests
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
+ADMIN_KEY = os.environ["ADMIN_KEY"]
 
 USERNAMES = [
     u.strip().lstrip("@")
@@ -23,1175 +26,1642 @@ USERNAMES = [
     if u.strip()
 ]
 
-ADMIN_KEY = os.environ.get("ADMIN_KEY", "")
+# Normal TikTok checking
+CHECK_EVERY_SEC = 60
+CHECK_BATCH = 20
 
+# Delivery
+DOWNLOAD_WORKERS = 2
+UPLOAD_WORKERS = 2
 
-# ============================================================
-# TIMING
-# ============================================================
+# Allow slower TikTok downloads without keeping a worker
+# stuck for an excessive amount of time.
+DOWNLOAD_TIMEOUT_SEC = 60
+DOWNLOAD_ATTEMPTS_PER_JOB = 2
 
-# How often each TikTok account is checked.
-CHECK_EVERY_SEC = 30
+UPLOAD_TIMEOUT_SEC = 180
+UPLOAD_ATTEMPTS_PER_JOB = 2
 
-# How often deletion checks run.
+DELIVERY_RETRY_DELAY_SEC = 30
+DELIVERY_RETRY_SCAN_SEC = 30
+
+# Deletion checking
 DELETE_CHECK_EVERY_SEC = 600
-
-# Number of recent videos requested from each account.
-CHECK_BATCH = 8
-
-
-# ============================================================
-# DELETION SETTINGS
-# ============================================================
+DELETE_CHECK_MAX_PER_CYCLE = 10
+DELETE_CHECK_DELAY_SEC = 3
 
 DELETE_FAIL_THRESHOLD = 3
 UNKNOWN_FAIL_THRESHOLD = 30
 
-# Delay between deletion checks.
-DELETE_CHECK_DELAY_SEC = 2
-
-
-# ============================================================
-# ACCOUNT CHECKING
-# ============================================================
-
-# Keep this low on Render Free to avoid unnecessary TikTok load.
-ACCOUNT_CHECK_WORKERS = 2
-
-# Maximum time allowed for one account check.
-ACCOUNT_CHECK_TIMEOUT_SEC = 25
-
-
-# ============================================================
-# VIDEO DOWNLOADING
-# ============================================================
-
-# Keep at 2 on Render Free.
-DOWNLOAD_WORKERS = 2
-
-DOWNLOAD_ATTEMPTS = 2
-
-# 30 seconds gives normal downloads some breathing room.
-DOWNLOAD_TIMEOUT_SEC = 30
-
-DOWNLOAD_RETRY_DELAY_SEC = 2
-
-
-# ============================================================
-# TELEGRAM
-# ============================================================
-
-TELEGRAM_UPLOAD_ATTEMPTS = 2
-TELEGRAM_TIMEOUT_SEC = 120
-
-
-# ============================================================
-# STATE
-# ============================================================
-
+# State
 STATE_DIR = "/tmp/tiktok_bot_state"
+STATE_MAX_ITEMS = 500
 
 os.makedirs(STATE_DIR, exist_ok=True)
 
 
 # ============================================================
-# GLOBALS
+# APP / LOCKS / EXECUTORS
 # ============================================================
 
 app = Flask(__name__)
 
+# Kept for compatibility with older state handling.
+# Actual state protection uses per-account locks below.
+STATE_LOCK = threading.RLock()
 
-STATE_LOCKS = {}
-STATE_LOCKS_GLOBAL = threading.Lock()
+# One lock per account.
+#
+# Normal checking and deletion checking cannot run
+# simultaneously for the same account.
+ACCOUNT_LOCKS = {
+    username: threading.Lock()
+    for username in USERNAMES
+}
 
-
-# Account checking executor.
-ACCOUNT_CHECK_EXECUTOR = ThreadPoolExecutor(
-    max_workers=ACCOUNT_CHECK_WORKERS
-)
-
-
-# Video downloads have their own completely separate workers.
-DOWNLOAD_EXECUTOR = ThreadPoolExecutor(
-    max_workers=DOWNLOAD_WORKERS
-)
-
-
-# Deletion checking is deliberately kept to one worker.
-DELETION_EXECUTOR = ThreadPoolExecutor(
-    max_workers=1
-)
-
+# Protects reading/writing the state for each account.
+STATE_LOCKS = {
+    username: threading.RLock()
+    for username in USERNAMES
+}
 
 # IMPORTANT:
 #
-# Only account/deletion yt-dlp processes use this semaphore.
-# Downloads DO NOT use it.
+# delivery_job does NOT run on DOWNLOAD_EXECUTOR.
 #
-# This keeps TikTok account checking relatively conservative
-# while allowing detected videos to download independently.
-ACCOUNT_SUBPROCESS_SEMAPHORE = threading.Semaphore(2)
+# delivery_job itself submits download_video to
+# DOWNLOAD_EXECUTOR and waits for the result. Running
+# delivery_job on the same executor would cause a
+# self-deadlock when all workers are occupied.
+DOWNLOAD_EXECUTOR = ThreadPoolExecutor(
+    max_workers=DOWNLOAD_WORKERS,
+    thread_name_prefix="download",
+)
 
+UPLOAD_EXECUTOR = ThreadPoolExecutor(
+    max_workers=UPLOAD_WORKERS,
+    thread_name_prefix="upload",
+)
 
-# ============================================================
-# LOGGING
-# ============================================================
-
-def log(message):
-    print(
-        f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}",
-        flush=True
-    )
-
-
-# ============================================================
-# STATE HELPERS
-# ============================================================
-
-def get_state_lock(username):
-
-    with STATE_LOCKS_GLOBAL:
-
-        if username not in STATE_LOCKS:
-            STATE_LOCKS[username] = threading.Lock()
-
-        return STATE_LOCKS[username]
-
-
-def state_path(username):
-
-    safe = "".join(
-        c if c.isalnum() or c in "._-" else "_"
-        for c in username
-    )
-
-    return os.path.join(
-        STATE_DIR,
-        f"{safe}_sent.json"
-    )
-
-
-def load_state(username):
-
-    path = state_path(username)
-
-    try:
-
-        with open(
-            path,
-            "r",
-            encoding="utf-8"
-        ) as f:
-
-            data = json.load(f)
-
-        if not isinstance(data, dict):
-
-            return {
-                "sent": {},
-                "deleted": {},
-                "unknown": {}
-            }
-
-        data.setdefault("sent", {})
-        data.setdefault("deleted", {})
-        data.setdefault("unknown", {})
-
-        return data
-
-    except Exception:
-
-        return {
-            "sent": {},
-            "deleted": {},
-            "unknown": {}
-        }
-
-
-def save_state(username, state):
-
-    path = state_path(username)
-    tmp = path + ".tmp"
-
-    with open(
-        tmp,
-        "w",
-        encoding="utf-8"
-    ) as f:
-
-        json.dump(
-            state,
-            f,
-            ensure_ascii=False,
-            indent=2
-        )
-
-    os.replace(
-        tmp,
-        path
-    )
+DELIVERY_QUEUED = set()
+DELIVERY_QUEUED_LOCK = threading.Lock()
 
 
 # ============================================================
 # TELEGRAM
 # ============================================================
 
-def telegram_url(method):
-
-    return (
-        f"https://api.telegram.org/bot"
-        f"{BOT_TOKEN}/{method}"
-    )
-
-
-def send_telegram_message(text):
-
-    start = time.monotonic()
+def tg_send_text(text):
 
     try:
 
         response = requests.post(
-            telegram_url("sendMessage"),
-            data={
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={
                 "chat_id": CHAT_ID,
                 "text": text,
-                "disable_web_page_preview": False
+                "disable_web_page_preview": True,
             },
-            timeout=15
+            timeout=15,
         )
 
-        elapsed = time.monotonic() - start
-
-        log(
-            f"Telegram message finished in "
-            f"{elapsed:.2f}s "
-            f"(HTTP {response.status_code})"
-        )
-
-        if response.ok:
-            return True
-
-        log(
-            f"Telegram message failed: "
-            f"{response.text[:500]}"
-        )
-
-        return False
+        return response.ok
 
     except Exception as e:
 
-        log(
-            f"Telegram message exception: {e}"
+        print(
+            f"[telegram] send text failed: {e}",
+            flush=True,
         )
 
         return False
 
 
-def send_telegram_video(
-    video_path,
-    caption=None
-):
-
-    for attempt in range(
-        1,
-        TELEGRAM_UPLOAD_ATTEMPTS + 1
-    ):
-
-        start = time.monotonic()
-
-        try:
-
-            log(
-                f"Telegram video upload attempt "
-                f"{attempt}/{TELEGRAM_UPLOAD_ATTEMPTS}"
-            )
-
-            with open(
-                video_path,
-                "rb"
-            ) as video_file:
-
-                files = {
-                    "video": (
-                        os.path.basename(video_path),
-                        video_file,
-                        "video/mp4"
-                    )
-                }
-
-                data = {
-                    "chat_id": CHAT_ID
-                }
-
-                if caption:
-                    data["caption"] = caption
-
-                response = requests.post(
-                    telegram_url("sendVideo"),
-                    data=data,
-                    files=files,
-                    timeout=TELEGRAM_TIMEOUT_SEC
-                )
-
-            elapsed = time.monotonic() - start
-
-            log(
-                f"Telegram upload finished in "
-                f"{elapsed:.2f}s "
-                f"(HTTP {response.status_code})"
-            )
-
-            if response.ok:
-                return True
-
-            log(
-                f"Telegram video upload failed: "
-                f"{response.text[:500]}"
-            )
-
-        except Exception as e:
-
-            elapsed = time.monotonic() - start
-
-            log(
-                f"Telegram upload exception after "
-                f"{elapsed:.2f}s: {e}"
-            )
-
-        if attempt < TELEGRAM_UPLOAD_ATTEMPTS:
-            time.sleep(2)
-
-    return False
-
-
-# ============================================================
-# TIKTOK URL
-# ============================================================
-
-def video_url(username, video_id):
-
-    return (
-        f"https://www.tiktok.com/"
-        f"@{username}/video/{video_id}"
-    )
-
-
-# ============================================================
-# ACCOUNT CHECK
-# ============================================================
-
-def latest_items(username):
-
-    command = [
-        "yt-dlp",
-        "--flat-playlist",
-        "-j",
-        "--playlist-end",
-        str(CHECK_BATCH),
-        "--user-agent",
-        "Mozilla/5.0",
-        f"https://www.tiktok.com/@{username}"
-    ]
-
-    start = time.monotonic()
-
-    # IMPORTANT:
-    #
-    # Wait for a slot instead of skipping the account.
-    #
-    # This keeps TikTok requests limited to 2 at once,
-    # but means accounts are queued rather than lost.
-    ACCOUNT_SUBPROCESS_SEMAPHORE.acquire()
+def tg_send_video(path, caption=""):
 
     try:
 
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=ACCOUNT_CHECK_TIMEOUT_SEC
-        )
+        with open(path, "rb") as f:
 
-    except subprocess.TimeoutExpired:
+            response = requests.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendVideo",
+                data={
+                    "chat_id": CHAT_ID,
+                    "caption": caption,
+                },
+                files={
+                    "video": f,
+                },
+                timeout=UPLOAD_TIMEOUT_SEC,
+            )
 
-        elapsed = time.monotonic() - start
-
-        log(
-            f"@{username}: account check timed out "
-            f"after {elapsed:.2f}s"
-        )
-
-        return []
+        return response.ok
 
     except Exception as e:
 
-        log(
-            f"@{username}: account check exception: "
-            f"{e}"
+        print(
+            f"[telegram] send video failed: {e}",
+            flush=True,
         )
 
-        return []
-
-    finally:
-
-        ACCOUNT_SUBPROCESS_SEMAPHORE.release()
-
-    elapsed = time.monotonic() - start
-
-    if result.returncode != 0:
-
-        log(
-            f"@{username}: account check failed "
-            f"after {elapsed:.2f}s: "
-            f"{result.stderr[-500:]}"
-        )
-
-        return []
-
-    items = []
-
-    for line in result.stdout.splitlines():
-
-        line = line.strip()
-
-        if not line:
-            continue
-
-        try:
-            data = json.loads(line)
-
-        except Exception:
-            continue
-
-        video_id = data.get("id")
-
-        if not video_id:
-            continue
-
-        items.append({
-            "id": str(video_id),
-            "title": data.get("title") or "",
-            "url": video_url(
-                username,
-                video_id
-            )
-        })
-
-    log(
-        f"@{username}: account check finished "
-        f"in {elapsed:.2f}s, "
-        f"found {len(items)} videos"
-    )
-
-    return items
+        return False
 
 
 # ============================================================
 # VIDEO DOWNLOAD
 # ============================================================
 
-def try_download_once(
-    username,
-    video_id,
-    workdir
-):
+def download_video(url):
 
-    url = video_url(
-        username,
-        video_id
+    tmpdir = tempfile.mkdtemp()
+
+    out = os.path.join(
+        tmpdir,
+        "%(id)s.%(ext)s",
     )
 
-    output_template = os.path.join(
-        workdir,
-        "%(id)s.%(ext)s"
-    )
-
-    command = [
-        "yt-dlp",
+    cmd = [
+        "python3",
+        "-m",
+        "yt_dlp",
         "-o",
-        output_template,
+        out,
         "-f",
         "best[ext=mp4]/best",
-        "--no-playlist",
         "--user-agent",
         "Mozilla/5.0",
-        url
+        url,
     ]
-
-    start = time.monotonic()
-
-    log(
-        f"DOWNLOAD START: {url}"
-    )
 
     try:
 
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=DOWNLOAD_TIMEOUT_SEC
+        subprocess.run(
+            cmd,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=DOWNLOAD_TIMEOUT_SEC,
         )
+
+        for name in os.listdir(tmpdir):
+
+            if name.lower().endswith(
+                (".mp4", ".webm", ".mkv")
+            ):
+
+                return os.path.join(
+                    tmpdir,
+                    name,
+                )
 
     except subprocess.TimeoutExpired:
 
-        elapsed = time.monotonic() - start
-
-        log(
-            f"DOWNLOAD TIMEOUT after "
-            f"{elapsed:.2f}s: {url}"
+        print(
+            f"[download] timeout after "
+            f"{DOWNLOAD_TIMEOUT_SEC}s",
+            flush=True,
         )
-
-        return None
 
     except Exception as e:
 
-        log(
-            f"DOWNLOAD EXCEPTION: {e}"
+        print(
+            f"[download] failed: {e}",
+            flush=True,
         )
 
-        return None
-
-    elapsed = time.monotonic() - start
-
-    if result.returncode != 0:
-
-        log(
-            f"DOWNLOAD FAILED after "
-            f"{elapsed:.2f}s: {url}"
-        )
-
-        if result.stderr:
-
-            log(
-                f"yt-dlp error: "
-                f"{result.stderr[-800:]}"
-            )
-
-        return None
-
-    files = []
-
-    try:
-
-        for name in os.listdir(workdir):
-
-            path = os.path.join(
-                workdir,
-                name
-            )
-
-            if os.path.isfile(path):
-                files.append(path)
-
-    except Exception:
-
-        return None
-
-    if not files:
-
-        log(
-            f"DOWNLOAD FAILED: no file produced "
-            f"after {elapsed:.2f}s"
-        )
-
-        return None
-
-    mp4_files = [
-        path
-        for path in files
-        if path.lower().endswith(".mp4")
-    ]
-
-    if mp4_files:
-
-        path = max(
-            mp4_files,
-            key=os.path.getsize
-        )
-
-    else:
-
-        path = max(
-            files,
-            key=os.path.getsize
-        )
-
-    try:
-
-        size = os.path.getsize(path)
-
-    except Exception:
-
-        return None
-
-    if size <= 0:
-
-        log(
-            "DOWNLOAD FAILED: empty file"
-        )
-
-        return None
-
-    log(
-        f"DOWNLOAD SUCCESS in "
-        f"{elapsed:.2f}s: {path}"
+    shutil.rmtree(
+        tmpdir,
+        ignore_errors=True,
     )
-
-    return path
-
-
-def download_video(
-    username,
-    video_id
-):
-
-    url = video_url(
-        username,
-        video_id
-    )
-
-    for attempt in range(
-        1,
-        DOWNLOAD_ATTEMPTS + 1
-    ):
-
-        log(
-            f"Download attempt "
-            f"{attempt}/{DOWNLOAD_ATTEMPTS}: "
-            f"{url}"
-        )
-
-        workdir = tempfile.mkdtemp(
-            prefix="tiktok_"
-        )
-
-        result = try_download_once(
-            username,
-            video_id,
-            workdir
-        )
-
-        if result:
-
-            return result
-
-        shutil.rmtree(
-            workdir,
-            ignore_errors=True
-        )
-
-        if attempt < DOWNLOAD_ATTEMPTS:
-
-            time.sleep(
-                DOWNLOAD_RETRY_DELAY_SEC
-            )
 
     return None
 
 
 # ============================================================
-# NEW VIDEO PIPELINE
+# STATE
 # ============================================================
 
-def handle_new_video(
-    username,
-    item
-):
+def state_file(username):
 
-    video_id = item["id"]
-    url = item["url"]
-
-    pipeline_start = time.monotonic()
-
-    log(
-        f"NEW VIDEO PIPELINE START "
-        f"@{username} / {video_id}"
+    return os.path.join(
+        STATE_DIR,
+        f"{username}_sent.json",
     )
 
-    # --------------------------------------------------------
-    # 1. SEND LINK IMMEDIATELY
-    # --------------------------------------------------------
 
-    link_start = time.monotonic()
-
-    link_text = (
-        f"@{username} posted a new TikTok:\n"
-        f"{url}"
-    )
-
-    link_success = send_telegram_message(
-        link_text
-    )
-
-    link_elapsed = (
-        time.monotonic() - link_start
-    )
-
-    log(
-        f"@{username} / {video_id}: "
-        f"link sent={link_success} "
-        f"in {link_elapsed:.2f}s"
-    )
-
-    # --------------------------------------------------------
-    # 2. DOWNLOAD VIDEO
-    # --------------------------------------------------------
-
-    download_start = time.monotonic()
-
-    video_path = download_video(
-        username,
-        video_id
-    )
-
-    download_elapsed = (
-        time.monotonic() - download_start
-    )
-
-    if not video_path:
-
-        log(
-            f"@{username} / {video_id}: "
-            f"download failed after "
-            f"{download_elapsed:.2f}s"
-        )
-
-        return False
-
-    # --------------------------------------------------------
-    # 3. SEND VIDEO AS SEPARATE MESSAGE
-    # --------------------------------------------------------
-
-    telegram_start = time.monotonic()
-
-    video_success = send_telegram_video(
-        video_path
-    )
-
-    telegram_elapsed = (
-        time.monotonic() - telegram_start
-    )
-
-    # --------------------------------------------------------
-    # CLEANUP
-    # --------------------------------------------------------
+def _load_state_unlocked(username):
 
     try:
 
-        workdir = os.path.dirname(
-            video_path
+        with open(
+            state_file(username),
+            "r",
+            encoding="utf-8",
+        ) as f:
+
+            data = json.load(f)
+
+    except FileNotFoundError:
+
+        return []
+
+    except Exception as e:
+
+        print(
+            f"[state] load failed for "
+            f"@{username}: {e}",
+            flush=True,
         )
 
-        shutil.rmtree(
-            workdir,
-            ignore_errors=True
+        return []
+
+    if not data:
+        return []
+
+    migrated = []
+
+    for item in data:
+
+        # ----------------------------------------------------
+        # Old format:
+        #
+        # ["video_id", "video_id", ...]
+        # ----------------------------------------------------
+
+        if isinstance(item, str):
+
+            migrated.append({
+                "id": item,
+                "url": "",
+                "title": "",
+                "deleted": False,
+                "fail_count": 0,
+                "unknown_count": 0,
+                "video_sent": True,
+                "delivery_retry_after": 0,
+                "last_delete_check": 0,
+            })
+
+            continue
+
+        if not isinstance(item, dict):
+            continue
+
+        migrated.append({
+            "id": item.get("id"),
+            "url": item.get("url", ""),
+            "title": item.get("title", ""),
+            "deleted": item.get("deleted", False),
+            "fail_count": item.get("fail_count", 0),
+            "unknown_count": item.get("unknown_count", 0),
+
+            # Existing entries from the old system were
+            # already delivered, so default them to True.
+            "video_sent": item.get(
+                "video_sent",
+                True,
+            ),
+
+            "delivery_retry_after": item.get(
+                "delivery_retry_after",
+                0,
+            ),
+
+            "last_delete_check": item.get(
+                "last_delete_check",
+                0,
+            ),
+        })
+
+    return migrated
+
+
+def _save_state_unlocked(username, items):
+
+    try:
+
+        path = state_file(username)
+        tmp = path + ".tmp"
+
+        with open(
+            tmp,
+            "w",
+            encoding="utf-8",
+        ) as f:
+
+            json.dump(
+                items[-STATE_MAX_ITEMS:],
+                f,
+            )
+
+        os.replace(
+            tmp,
+            path,
         )
 
-    except Exception:
-        pass
+    except Exception as e:
 
-    total_elapsed = (
-        time.monotonic() - pipeline_start
-    )
+        print(
+            f"[state] save failed for "
+            f"@{username}: {e}",
+            flush=True,
+        )
 
-    log(
-        f"PIPELINE COMPLETE "
-        f"@{username} / {video_id} | "
-        f"download={download_elapsed:.2f}s | "
-        f"telegram={telegram_elapsed:.2f}s | "
-        f"total={total_elapsed:.2f}s | "
-        f"link={link_success} | "
-        f"video={video_success}"
-    )
 
-    return video_success
+def load_state(username):
+
+    with STATE_LOCKS[username]:
+
+        return _load_state_unlocked(
+            username
+        )
+
+
+def save_state(username, items):
+
+    with STATE_LOCKS[username]:
+
+        _save_state_unlocked(
+            username,
+            items,
+        )
 
 
 # ============================================================
-# ACCOUNT PROCESSING
+# TIKTOK LOOKUP
+# ============================================================
+
+def latest_items(username):
+
+    url = (
+        f"https://www.tiktok.com/@{username}"
+    )
+
+    cmd = [
+        "python3",
+        "-m",
+        "yt_dlp",
+        "-j",
+        "--playlist-end",
+        str(CHECK_BATCH),
+        "--user-agent",
+        "Mozilla/5.0",
+        url,
+    ]
+
+    start = time.time()
+
+    try:
+
+        p = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=80,
+            check=True,
+        )
+
+        items = []
+
+        for line in p.stdout.splitlines():
+
+            try:
+
+                obj = json.loads(line)
+
+            except Exception:
+
+                continue
+
+            vid_id = obj.get("id")
+
+            vid_url = (
+                obj.get("webpage_url")
+                or obj.get("url")
+            )
+
+            title = obj.get("title") or ""
+
+            if vid_id and vid_url:
+
+                items.append({
+                    "id": str(vid_id),
+                    "url": vid_url,
+                    "title": title,
+                })
+
+        elapsed = (
+            time.time()
+            - start
+        )
+
+        print(
+            f"[check] @{username}: "
+            f"found {len(items)} videos "
+            f"in {elapsed:.2f}s",
+            flush=True,
+        )
+
+        return items
+
+    except subprocess.TimeoutExpired:
+
+        elapsed = (
+            time.time()
+            - start
+        )
+
+        print(
+            f"[check] @{username}: "
+            f"timeout after {elapsed:.2f}s",
+            flush=True,
+        )
+
+        return []
+
+    except Exception as e:
+
+        elapsed = (
+            time.time()
+            - start
+        )
+
+        print(
+            f"[check] @{username}: "
+            f"failed after {elapsed:.2f}s: {e}",
+            flush=True,
+        )
+
+        return []
+
+
+# ============================================================
+# DELETION CHECK
+# ============================================================
+
+REMOVED_PHRASES = [
+    "video currently unavailable",
+    "this post is unavailable",
+    "content isn't available",
+    "content unavailable",
+    "video not available",
+    "removed by the creator",
+]
+
+
+def video_still_exists(url):
+
+    cmd = [
+        "python3",
+        "-m",
+        "yt_dlp",
+        "-j",
+        "--user-agent",
+        "Mozilla/5.0",
+        url,
+    ]
+
+    try:
+
+        p = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+    except subprocess.TimeoutExpired:
+
+        return "unknown"
+
+    except Exception:
+
+        return "unknown"
+
+    if p.returncode == 0:
+
+        return "exists"
+
+    err = (
+        (p.stderr or "")
+        + "\n"
+        + (p.stdout or "")
+    ).lower()
+
+    if any(
+        phrase in err
+        for phrase in REMOVED_PHRASES
+    ):
+
+        return "deleted"
+
+    # A private account is not proof that the
+    # individual video was deleted.
+    if "user's account is private" in err:
+
+        return "unknown"
+
+    return "unknown"
+
+
+# ============================================================
+# DELIVERY QUEUE
+# ============================================================
+
+def queue_delivery(username, video_id):
+
+    key = (
+        username,
+        video_id,
+    )
+
+    with DELIVERY_QUEUED_LOCK:
+
+        if key in DELIVERY_QUEUED:
+
+            return False
+
+        DELIVERY_QUEUED.add(key)
+
+    try:
+
+        # delivery_job runs on its own daemon thread.
+        # It must NOT run on DOWNLOAD_EXECUTOR.
+        threading.Thread(
+            target=delivery_job,
+            args=(
+                username,
+                video_id,
+            ),
+            daemon=True,
+            name=f"delivery-{username}-{video_id}",
+        ).start()
+
+        return True
+
+    except Exception:
+
+        with DELIVERY_QUEUED_LOCK:
+
+            DELIVERY_QUEUED.discard(key)
+
+        return False
+
+
+def delivery_job(username, video_id):
+
+    key = (
+        username,
+        video_id,
+    )
+
+    path = None
+
+    try:
+
+        # ----------------------------------------------------
+        # Get current state
+        # ----------------------------------------------------
+
+        with STATE_LOCKS[username]:
+
+            state = _load_state_unlocked(
+                username
+            )
+
+            item = None
+
+            for entry in state:
+
+                if entry.get("id") == video_id:
+
+                    item = dict(entry)
+                    break
+
+        if item is None:
+
+            print(
+                f"[delivery] @{username} "
+                f"{video_id}: state entry missing",
+                flush=True,
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # Never deliver something already deleted
+        # ----------------------------------------------------
+
+        if item.get("deleted"):
+
+            print(
+                f"[delivery] @{username} "
+                f"{video_id}: deleted; "
+                f"delivery stopped",
+                flush=True,
+            )
+
+            return
+
+        if item.get("video_sent"):
+
+            print(
+                f"[delivery] @{username} "
+                f"{video_id}: already delivered",
+                flush=True,
+            )
+
+            return
+
+        url = item.get(
+            "url",
+            "",
+        )
+
+        title = item.get(
+            "title",
+            "",
+        )
+
+        if not url:
+
+            print(
+                f"[delivery] @{username} "
+                f"{video_id}: no URL",
+                flush=True,
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # Download
+        # ----------------------------------------------------
+
+        path = None
+
+        for attempt in range(
+            1,
+            DOWNLOAD_ATTEMPTS_PER_JOB + 1,
+        ):
+
+            start = time.time()
+
+            print(
+                f"[delivery] @{username} "
+                f"{video_id}: "
+                f"download attempt "
+                f"{attempt}/"
+                f"{DOWNLOAD_ATTEMPTS_PER_JOB}",
+                flush=True,
+            )
+
+            # Only the actual download occupies a
+            # DOWNLOAD_EXECUTOR worker.
+            download_future = (
+                DOWNLOAD_EXECUTOR.submit(
+                    download_video,
+                    url,
+                )
+            )
+
+            try:
+
+                path = download_future.result(
+                    timeout=DOWNLOAD_TIMEOUT_SEC + 5
+                )
+
+            except Exception as e:
+
+                print(
+                    f"[delivery] @{username} "
+                    f"{video_id}: "
+                    f"download exception: {e}",
+                    flush=True,
+                )
+
+                path = None
+
+            elapsed = (
+                time.time()
+                - start
+            )
+
+            if path:
+
+                print(
+                    f"[delivery] @{username} "
+                    f"{video_id}: "
+                    f"download success "
+                    f"in {elapsed:.2f}s",
+                    flush=True,
+                )
+
+                break
+
+            print(
+                f"[delivery] @{username} "
+                f"{video_id}: "
+                f"download failed "
+                f"after {elapsed:.2f}s",
+                flush=True,
+            )
+
+            if attempt < DOWNLOAD_ATTEMPTS_PER_JOB:
+
+                time.sleep(1)
+
+        # ----------------------------------------------------
+        # Download failed
+        # ----------------------------------------------------
+
+        if not path:
+
+            deleted_now = False
+            entry_found = False
+
+            with STATE_LOCKS[username]:
+
+                state = _load_state_unlocked(
+                    username
+                )
+
+                for entry in state:
+
+                    if entry.get("id") == video_id:
+
+                        entry_found = True
+
+                        if entry.get("deleted"):
+
+                            deleted_now = True
+                            break
+
+                        entry["video_sent"] = False
+
+                        entry[
+                            "delivery_retry_after"
+                        ] = (
+                            time.time()
+                            + DELIVERY_RETRY_DELAY_SEC
+                        )
+
+                        break
+
+                if entry_found:
+
+                    _save_state_unlocked(
+                        username,
+                        state,
+                    )
+
+            if deleted_now:
+
+                print(
+                    f"[delivery] @{username} "
+                    f"{video_id}: "
+                    f"deleted; "
+                    f"delivery stopped",
+                    flush=True,
+                )
+
+            else:
+
+                print(
+                    f"[delivery] @{username} "
+                    f"{video_id}: "
+                    f"download failed; "
+                    f"full retry scheduled",
+                    flush=True,
+                )
+
+            return
+
+        # ----------------------------------------------------
+        # Upload
+        # ----------------------------------------------------
+
+        caption = (
+            f"🎬 New video from @{username}\n"
+            f"{title}\n"
+            f"{url}"
+        )
+
+        uploaded = False
+
+        for attempt in range(
+            1,
+            UPLOAD_ATTEMPTS_PER_JOB + 1,
+        ):
+
+            # Re-check deletion before every upload attempt.
+            with STATE_LOCKS[username]:
+
+                state = _load_state_unlocked(
+                    username
+                )
+
+                current = None
+
+                for entry in state:
+
+                    if entry.get("id") == video_id:
+
+                        current = entry
+                        break
+
+                if current is None:
+
+                    print(
+                        f"[delivery] @{username} "
+                        f"{video_id}: "
+                        f"state entry disappeared",
+                        flush=True,
+                    )
+
+                    return
+
+                if current.get("deleted"):
+
+                    print(
+                        f"[delivery] @{username} "
+                        f"{video_id}: "
+                        f"deleted before upload; "
+                        f"delivery stopped",
+                        flush=True,
+                    )
+
+                    return
+
+            start = time.time()
+
+            print(
+                f"[delivery] @{username} "
+                f"{video_id}: "
+                f"upload attempt "
+                f"{attempt}/"
+                f"{UPLOAD_ATTEMPTS_PER_JOB}",
+                flush=True,
+            )
+
+            upload_future = (
+                UPLOAD_EXECUTOR.submit(
+                    tg_send_video,
+                    path,
+                    caption,
+                )
+            )
+
+            try:
+
+                uploaded = upload_future.result(
+                    timeout=UPLOAD_TIMEOUT_SEC + 5
+                )
+
+            except Exception as e:
+
+                print(
+                    f"[delivery] @{username} "
+                    f"{video_id}: "
+                    f"upload exception: {e}",
+                    flush=True,
+                )
+
+                uploaded = False
+
+            elapsed = (
+                time.time()
+                - start
+            )
+
+            if uploaded:
+
+                print(
+                    f"[delivery] @{username} "
+                    f"{video_id}: "
+                    f"Telegram upload finished "
+                    f"in {elapsed:.2f}s",
+                    flush=True,
+                )
+
+                break
+
+            print(
+                f"[delivery] @{username} "
+                f"{video_id}: "
+                f"upload failed "
+                f"after {elapsed:.2f}s",
+                flush=True,
+            )
+
+            if attempt < UPLOAD_ATTEMPTS_PER_JOB:
+
+                time.sleep(1)
+
+        # ----------------------------------------------------
+        # Upload failed
+        # ----------------------------------------------------
+
+        if not uploaded:
+
+            deleted_now = False
+            entry_found = False
+
+            with STATE_LOCKS[username]:
+
+                state = _load_state_unlocked(
+                    username
+                )
+
+                for entry in state:
+
+                    if entry.get("id") == video_id:
+
+                        entry_found = True
+
+                        if entry.get("deleted"):
+
+                            deleted_now = True
+                            break
+
+                        entry["video_sent"] = False
+
+                        entry[
+                            "delivery_retry_after"
+                        ] = (
+                            time.time()
+                            + DELIVERY_RETRY_DELAY_SEC
+                        )
+
+                        break
+
+                if entry_found:
+
+                    _save_state_unlocked(
+                        username,
+                        state,
+                    )
+
+            if deleted_now:
+
+                print(
+                    f"[delivery] @{username} "
+                    f"{video_id}: "
+                    f"deleted; "
+                    f"delivery stopped",
+                    flush=True,
+                )
+
+            else:
+
+                print(
+                    f"[delivery] @{username} "
+                    f"{video_id}: "
+                    f"upload failed; "
+                    f"full retry scheduled",
+                    flush=True,
+                )
+
+            return
+
+        # ----------------------------------------------------
+        # Successful delivery
+        # ----------------------------------------------------
+
+        with STATE_LOCKS[username]:
+
+            state = _load_state_unlocked(
+                username
+            )
+
+            for entry in state:
+
+                if entry.get("id") == video_id:
+
+                    if entry.get("deleted"):
+
+                        print(
+                            f"[delivery] @{username} "
+                            f"{video_id}: "
+                            f"deleted after upload",
+                            flush=True,
+                        )
+
+                        return
+
+                    entry["video_sent"] = True
+                    entry["delivery_retry_after"] = 0
+
+                    break
+
+            _save_state_unlocked(
+                username,
+                state,
+            )
+
+        print(
+            f"[delivery] @{username} "
+            f"{video_id}: "
+            f"delivery complete",
+            flush=True,
+        )
+
+    except Exception as e:
+
+        print(
+            f"[delivery] @{username} "
+            f"{video_id}: "
+            f"unexpected error: {e}",
+            flush=True,
+        )
+
+    finally:
+
+        # Clean up downloaded video.
+        if path:
+
+            try:
+
+                tmpdir = os.path.dirname(
+                    path
+                )
+
+                shutil.rmtree(
+                    tmpdir,
+                    ignore_errors=True,
+                )
+
+            except Exception:
+                pass
+
+        with DELIVERY_QUEUED_LOCK:
+
+            DELIVERY_QUEUED.discard(key)
+
+
+# ============================================================
+# NORMAL ACCOUNT CHECK
 # ============================================================
 
 def process_account(username):
 
-    items = latest_items(
-        username
-    )
+    # Do not allow this account's normal check to overlap
+    # with another normal/deletion check.
+    if not ACCOUNT_LOCKS[username].acquire(
+        blocking=False
+    ):
 
-    if not items:
+        print(
+            f"[check] @{username}: "
+            f"previous check still running; "
+            f"skipping this cycle",
+            flush=True,
+        )
+
         return
-
-    lock = get_state_lock(
-        username
-    )
-
-    new_items = []
-
-    with lock:
-
-        state = load_state(
-            username
-        )
-
-        sent = state.setdefault(
-            "sent",
-            {}
-        )
-
-        # Reverse so oldest detected item is queued first.
-        for item in reversed(items):
-
-            video_id = item["id"]
-
-            if video_id in sent:
-                continue
-
-            # Mark it immediately.
-            #
-            # This prevents duplicate downloads if two checks
-            # overlap.
-            sent[video_id] = {
-                "first_seen": int(
-                    time.time()
-                ),
-                "url": item["url"],
-                "video_sent": False
-            }
-
-            new_items.append(
-                item
-            )
-
-        save_state(
-            username,
-            state
-        )
-
-    if not new_items:
-        return
-
-    log(
-        f"@{username}: detected "
-        f"{len(new_items)} new video(s)"
-    )
-
-    # IMPORTANT:
-    #
-    # Do NOT run deletion checking here.
-    #
-    # Submit directly to the independent download executor.
-    for item in new_items:
-
-        DOWNLOAD_EXECUTOR.submit(
-            handle_new_video,
-            username,
-            item
-        )
-
-
-# ============================================================
-# VIDEO EXISTENCE / DELETION CHECK
-# ============================================================
-
-def check_video_exists(
-    username,
-    video_id
-):
-
-    url = video_url(
-        username,
-        video_id
-    )
-
-    command = [
-        "yt-dlp",
-        "--simulate",
-        "--no-playlist",
-        "--user-agent",
-        "Mozilla/5.0",
-        url
-    ]
-
-    # Deletion checks share ONLY the conservative
-    # account/deletion semaphore.
-    ACCOUNT_SUBPROCESS_SEMAPHORE.acquire()
 
     try:
 
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=20
+        items = latest_items(
+            username
         )
 
-    except subprocess.TimeoutExpired:
+        if not items:
+            return
 
-        log(
-            f"Deletion check timed out: {url}"
-        )
+        # ----------------------------------------------------
+        # Find new videos.
+        #
+        # Only state access is protected by the state lock.
+        # No Telegram network request happens while holding
+        # STATE_LOCKS.
+        # ----------------------------------------------------
 
-        return None
+        with STATE_LOCKS[username]:
 
-    except Exception as e:
+            state = _load_state_unlocked(
+                username
+            )
 
-        log(
-            f"Deletion check exception: {e}"
-        )
+            sent_ids = {
+                str(entry.get("id"))
+                for entry in state
+                if entry.get("id")
+            }
 
-        return None
+            new_items = [
+                item
+                for item in items
+                if item["id"] not in sent_ids
+            ]
+
+            # On a completely new account, don't suddenly
+            # send the entire backlog.
+            if (
+                len(state) == 0
+                and len(new_items) > 1
+            ):
+
+                new_items = new_items[:1]
+
+        # ----------------------------------------------------
+        # Send links immediately.
+        #
+        # IMPORTANT:
+        # tg_send_text() is outside STATE_LOCKS because it
+        # performs network I/O.
+        # ----------------------------------------------------
+
+        for item in reversed(new_items):
+
+            video_id = item["id"]
+            url = item["url"]
+            title = item["title"]
+
+            caption = (
+                f"🎬 New video from @{username}\n"
+                f"{title}\n"
+                f"{url}"
+            )
+
+            link_start = time.time()
+
+            link_sent = tg_send_text(
+                caption
+            )
+
+            link_elapsed = (
+                time.time()
+                - link_start
+            )
+
+            if not link_sent:
+
+                print(
+                    f"[new] @{username} "
+                    f"{video_id}: "
+                    f"link send failed "
+                    f"after "
+                    f"{link_elapsed:.2f}s; "
+                    f"will retry",
+                    flush=True,
+                )
+
+                continue
+
+            print(
+                f"[new] @{username} "
+                f"{video_id}: "
+                f"link sent in "
+                f"{link_elapsed:.2f}s",
+                flush=True,
+            )
+
+            # ------------------------------------------------
+            # Re-acquire state lock after the network call.
+            #
+            # Another thread may have changed state while
+            # Telegram was processing the request, so re-load
+            # the current state and check the ID again.
+            # ------------------------------------------------
+
+            already_saved = False
+
+            with STATE_LOCKS[username]:
+
+                state = _load_state_unlocked(
+                    username
+                )
+
+                for entry in state:
+
+                    if entry.get("id") == video_id:
+
+                        already_saved = True
+                        break
+
+                if not already_saved:
+
+                    state.append({
+                        "id": video_id,
+                        "url": url,
+                        "title": title,
+                        "deleted": False,
+                        "fail_count": 0,
+                        "unknown_count": 0,
+
+                        # Link has been sent, but the actual
+                        # video still needs to be delivered.
+                        "video_sent": False,
+
+                        "delivery_retry_after": 0,
+
+                        # Don't immediately declare a freshly
+                        # posted video deleted.
+                        "last_delete_check": time.time(),
+                    })
+
+                    _save_state_unlocked(
+                        username,
+                        state,
+                    )
+
+            if already_saved:
+
+                print(
+                    f"[new] @{username} "
+                    f"{video_id}: "
+                    f"already exists in state; "
+                    f"not queueing duplicate",
+                    flush=True,
+                )
+
+                continue
+
+            # Queue actual video delivery after the
+            # link has already been sent.
+            queue_delivery(
+                username,
+                video_id,
+            )
 
     finally:
 
-        ACCOUNT_SUBPROCESS_SEMAPHORE.release()
+        ACCOUNT_LOCKS[username].release()
 
-    if result.returncode == 0:
-        return True
 
-    stderr = (
-        result.stderr or ""
-    ).lower()
+# ============================================================
+# DELETION CHECK FOR ONE ACCOUNT
+# ============================================================
 
-    deleted_words = [
-        "not available",
-        "does not exist",
-        "has been removed",
-        "video unavailable",
-        "video is unavailable",
-        "content is unavailable",
-        "private video"
-    ]
+def check_deletions_for_account(username):
 
-    if any(
-        word in stderr
-        for word in deleted_words
+    # Deletion checks are secondary to normal checks.
+    #
+    # The entire deletion cycle owns this account lock so
+    # normal checking can never overlap with it.
+    if not ACCOUNT_LOCKS[username].acquire(
+        blocking=False
     ):
 
-        return False
-
-    return None
-
-
-def deletion_sweep(username):
-
-    lock = get_state_lock(
-        username
-    )
-
-    with lock:
-
-        state = load_state(
-            username
+        print(
+            f"[delete] @{username}: "
+            f"account busy; "
+            f"skipping deletion cycle",
+            flush=True,
         )
 
-        sent = state.setdefault(
-            "sent",
-            {}
-        )
-
-        deleted = state.setdefault(
-            "deleted",
-            {}
-        )
-
-        unknown = state.setdefault(
-            "unknown",
-            {}
-        )
-
-        now = int(
-            time.time()
-        )
-
-        candidates = []
-
-        for video_id, info in list(
-            sent.items()
-        ):
-
-            first_seen = int(
-                info.get(
-                    "first_seen",
-                    now
-                )
-            )
-
-            age = now - first_seen
-
-            # Never immediately deletion-check a newly
-            # detected video.
-            if age < 120:
-                continue
-
-            if video_id in deleted:
-                continue
-
-            candidates.append(
-                video_id
-            )
-
-    if not candidates:
         return
 
-    log(
-        f"@{username}: starting deletion sweep "
-        f"({len(candidates)} videos)"
-    )
+    try:
 
-    for video_id in candidates:
+        with STATE_LOCKS[username]:
 
-        result = check_video_exists(
-            username,
-            video_id
-        )
-
-        with lock:
-
-            state = load_state(
+            state = _load_state_unlocked(
                 username
             )
 
-            sent = state.setdefault(
-                "sent",
-                {}
+            candidates = [
+                entry
+                for entry in state
+                if (
+                    not entry.get("deleted")
+                    and entry.get("url")
+                )
+            ]
+
+            # Rotate through the oldest checked videos.
+            candidates.sort(
+                key=lambda entry:
+                entry.get(
+                    "last_delete_check",
+                    0,
+                )
             )
 
-            deleted = state.setdefault(
-                "deleted",
-                {}
+            candidates = candidates[
+                :DELETE_CHECK_MAX_PER_CYCLE
+            ]
+
+        if not candidates:
+            return
+
+        for index, item in enumerate(
+            candidates
+        ):
+
+            video_id = item.get("id")
+            url = item.get("url")
+
+            if not video_id or not url:
+                continue
+
+            # Never immediately deletion-check a fresh post.
+            age_since_check = (
+                time.time()
+                - item.get(
+                    "last_delete_check",
+                    0,
+                )
             )
 
-            unknown = state.setdefault(
-                "unknown",
-                {}
+            if (
+                item.get("last_delete_check", 0)
+                and age_since_check < 120
+            ):
+
+                continue
+
+            result = video_still_exists(
+                url
             )
 
-            if result is True:
+            changed = False
+            deletion_alert = None
 
-                unknown.pop(
-                    video_id,
-                    None
+            # ------------------------------------------------
+            # State modification only.
+            #
+            # Telegram is deliberately NOT called here while
+            # the state lock is held.
+            # ------------------------------------------------
+
+            with STATE_LOCKS[username]:
+
+                state = _load_state_unlocked(
+                    username
                 )
 
-            elif result is False:
+                current = None
 
-                previous = deleted.get(
-                    video_id,
-                    0
-                )
+                for entry in state:
 
-                previous += 1
+                    if entry.get("id") == video_id:
 
-                deleted[video_id] = previous
+                        current = entry
+                        break
 
-                unknown.pop(
-                    video_id,
-                    None
-                )
+                if current is None:
+                    continue
 
-                log(
-                    f"@{username}: deletion "
-                    f"confirmation "
-                    f"{previous}/"
-                    f"{DELETE_FAIL_THRESHOLD} "
-                    f"for {video_id}"
-                )
+                current[
+                    "last_delete_check"
+                ] = time.time()
 
-                if previous >= DELETE_FAIL_THRESHOLD:
+                changed = True
 
-                    sent.pop(
-                        video_id,
-                        None
+                if result == "exists":
+
+                    if (
+                        current.get(
+                            "fail_count",
+                            0,
+                        ) != 0
+                        or current.get(
+                            "unknown_count",
+                            0,
+                        ) != 0
+                    ):
+
+                        current[
+                            "fail_count"
+                        ] = 0
+
+                        current[
+                            "unknown_count"
+                        ] = 0
+
+                    changed = True
+
+                elif result == "deleted":
+
+                    current[
+                        "fail_count"
+                    ] = (
+                        current.get(
+                            "fail_count",
+                            0,
+                        )
+                        + 1
                     )
 
-                    deleted.pop(
-                        video_id,
-                        None
+                    if (
+                        current[
+                            "fail_count"
+                        ]
+                        >= DELETE_FAIL_THRESHOLD
+                    ):
+
+                        current[
+                            "deleted"
+                        ] = True
+
+                        title = current.get(
+                            "title",
+                            "",
+                        )
+
+                        deletion_alert = (
+                            f"🗑️ Video deleted by "
+                            f"@{username}\n"
+                            f"{title}\n"
+                            f"{url}"
+                        )
+
+                        print(
+                            f"[delete] @{username} "
+                            f"{video_id}: "
+                            f"confirmed deleted",
+                            flush=True,
+                        )
+
+                else:
+
+                    current[
+                        "unknown_count"
+                    ] = (
+                        current.get(
+                            "unknown_count",
+                            0,
+                        )
+                        + 1
                     )
 
-                    unknown.pop(
-                        video_id,
-                        None
+                    # Unknown errors are deliberately
+                    # much harder to turn into a deletion.
+                    if (
+                        current[
+                            "unknown_count"
+                        ]
+                        >= UNKNOWN_FAIL_THRESHOLD
+                    ):
+
+                        current[
+                            "deleted"
+                        ] = True
+
+                        title = current.get(
+                            "title",
+                            "",
+                        )
+
+                        deletion_alert = (
+                            f"🗑️ Video likely "
+                            f"deleted by "
+                            f"@{username} "
+                            f"(unconfirmed - "
+                            f"repeated errors, "
+                            f"not a direct removal "
+                            f"message)\n"
+                            f"{title}\n"
+                            f"{url}"
+                        )
+
+                        print(
+                            f"[delete] @{username} "
+                            f"{video_id}: "
+                            f"marked likely deleted "
+                            f"after repeated "
+                            f"unknown errors",
+                            flush=True,
+                        )
+
+                if changed:
+
+                    _save_state_unlocked(
+                        username,
+                        state,
                     )
 
-                    log(
-                        f"@{username}: confirmed deleted "
-                        f"{video_id}"
-                    )
+            # Telegram network request happens AFTER
+            # releasing the state lock.
+            if deletion_alert:
 
-            else:
-
-                count = unknown.get(
-                    video_id,
-                    0
+                tg_send_text(
+                    deletion_alert
                 )
 
-                count += 1
+            if index < len(candidates) - 1:
 
-                unknown[video_id] = count
-
-                log(
-                    f"@{username}: unknown deletion "
-                    f"result {count}/"
-                    f"{UNKNOWN_FAIL_THRESHOLD} "
-                    f"for {video_id}"
+                time.sleep(
+                    DELETE_CHECK_DELAY_SEC
                 )
 
-            save_state(
-                username,
-                state
-            )
+    finally:
 
-        time.sleep(
-            DELETE_CHECK_DELAY_SEC
-        )
+        ACCOUNT_LOCKS[username].release()
 
 
 # ============================================================
-# ACCOUNT WATCH LOOP
+# DELIVERY RETRY WORKER
 # ============================================================
 
-def watch_account(username):
-
-    log(
-        f"Started watcher for @{username}"
-    )
-
-    # Small startup staggering.
-    stagger = (
-        sum(ord(c) for c in username)
-        % 10
-    )
-
-    if stagger:
-        time.sleep(stagger)
+def delivery_retry_worker():
 
     while True:
 
-        start = time.monotonic()
-
         try:
 
-            process_account(
-                username
-            )
+            now = time.time()
+
+            for username in USERNAMES:
+
+                with STATE_LOCKS[username]:
+
+                    state = _load_state_unlocked(
+                        username
+                    )
+
+                    candidates = []
+
+                    for item in state:
+
+                        # Never retry deleted videos.
+                        if item.get("deleted"):
+                            continue
+
+                        if item.get("video_sent"):
+                            continue
+
+                        if not item.get("url"):
+                            continue
+
+                        retry_after = item.get(
+                            "delivery_retry_after",
+                            0,
+                        )
+
+                        if retry_after > now:
+                            continue
+
+                        video_id = item.get("id")
+
+                        if video_id:
+
+                            candidates.append(
+                                video_id
+                            )
+
+                # Queue outside the state lock.
+                for video_id in candidates:
+
+                    queue_delivery(
+                        username,
+                        video_id,
+                    )
 
         except Exception as e:
 
-            log(
-                f"@{username}: watcher exception: "
-                f"{e}"
+            print(
+                f"[retry-worker] error: {e}",
+                flush=True,
             )
 
-        elapsed = (
-            time.monotonic() - start
+        time.sleep(
+            DELIVERY_RETRY_SCAN_SEC
         )
 
-        # Aim for roughly 30 seconds between
-        # the START of checks for each account.
+
+# ============================================================
+# DELETION WORKER
+# ============================================================
+
+def deletion_worker():
+
+    # Give startup/new-video processing time before
+    # the first deletion sweep.
+    time.sleep(
+        DELETE_CHECK_EVERY_SEC
+    )
+
+    while True:
+
+        cycle_start = time.time()
+
+        for username in USERNAMES:
+
+            try:
+
+                check_deletions_for_account(
+                    username
+                )
+
+            except Exception as e:
+
+                print(
+                    f"[delete] @{username}: "
+                    f"error: {e}",
+                    flush=True,
+                )
+
+        elapsed = (
+            time.time()
+            - cycle_start
+        )
+
         sleep_for = max(
-            0,
-            CHECK_EVERY_SEC - elapsed
+            1,
+            DELETE_CHECK_EVERY_SEC
+            - elapsed,
         )
 
         time.sleep(
@@ -1200,176 +1670,210 @@ def watch_account(username):
 
 
 # ============================================================
-# DELETION LOOP
+# INDEPENDENT ACCOUNT WORKER
 # ============================================================
 
-def deletion_loop(username):
+def account_worker(username):
 
-    stagger = (
-        sum(ord(c) for c in username)
-        % 60
+    print(
+        f"[worker] started for @{username}",
+        flush=True,
     )
 
-    if stagger:
-        time.sleep(stagger)
+    # Stagger startup very slightly so all account
+    # yt-dlp processes do not launch at precisely
+    # the same moment.
+    time.sleep(
+        USERNAMES.index(username) * 0.5
+    )
+
+    next_check = time.time()
 
     while True:
 
-        start = time.monotonic()
-
         try:
 
-            deletion_sweep(
-                username
-            )
+            now = time.time()
+
+            if now >= next_check:
+
+                process_account(
+                    username
+                )
+
+                # Start-to-start scheduling.
+                next_check += CHECK_EVERY_SEC
+
+                # If a check took longer than the interval,
+                # don't perform a pile of catch-up checks.
+                if next_check <= time.time():
+
+                    next_check = (
+                        time.time()
+                        + CHECK_EVERY_SEC
+                    )
 
         except Exception as e:
 
-            log(
-                f"@{username}: deletion sweep exception: "
-                f"{e}"
+            print(
+                f"[worker] @{username}: "
+                f"error: {e}",
+                flush=True,
             )
 
-        elapsed = (
-            time.monotonic() - start
-        )
+            next_check = (
+                time.time()
+                + CHECK_EVERY_SEC
+            )
 
         sleep_for = max(
-            0,
-            DELETE_CHECK_EVERY_SEC - elapsed
+            0.2,
+            next_check - time.time(),
         )
 
         time.sleep(
-            sleep_for
+            min(
+                sleep_for,
+                1.0,
+            )
         )
 
 
 # ============================================================
-# FLASK
+# ADMIN AUTH
 # ============================================================
 
-@app.route("/")
-def home():
+def admin_authorized():
 
-    return "TikTok bot running"
+    supplied_key = request.args.get(
+        "key",
+        "",
+    )
+
+    return hmac.compare_digest(
+        supplied_key,
+        ADMIN_KEY,
+    )
 
 
-@app.route("/health")
+# ============================================================
+# FLASK ROUTES
+# ============================================================
+
+@app.get("/")
 def health():
+
+    return "ok"
+
+
+@app.get("/health")
+def health_check():
 
     return jsonify({
         "status": "ok",
-        "accounts": len(USERNAMES)
+        "accounts": USERNAMES,
     })
 
 
-# ============================================================
-# MANUAL CHECK
-# ============================================================
+@app.get("/check")
+def check_now():
 
-@app.route("/check")
-def manual_check():
+    if not admin_authorized():
 
-    key = request.args.get(
-        "key",
-        ""
-    )
+        return "forbidden", 403
 
-    if ADMIN_KEY and key != ADMIN_KEY:
-
-        return jsonify({
-            "error": "unauthorized"
-        }), 401
-
-    for username in USERNAMES:
-
-        ACCOUNT_CHECK_EXECUTOR.submit(
-            process_account,
-            username
-        )
-
-    return jsonify({
-        "status": "checks queued"
-    })
-
-
-# ============================================================
-# MANUAL DELETION CHECK
-# ============================================================
-
-@app.route("/check_deletions")
-def manual_deletions():
-
-    key = request.args.get(
-        "key",
-        ""
-    )
-
-    if ADMIN_KEY and key != ADMIN_KEY:
-
-        return jsonify({
-            "error": "unauthorized"
-        }), 401
-
-    for username in USERNAMES:
-
-        DELETION_EXECUTOR.submit(
-            deletion_sweep,
-            username
-        )
-
-    return jsonify({
-        "status": "deletion checks queued"
-    })
-
-
-# ============================================================
-# START BACKGROUND WORKERS
-# ============================================================
-
-def start_background_threads():
-
+    # Trigger checks concurrently.
     for username in USERNAMES:
 
         threading.Thread(
-            target=watch_account,
+            target=process_account,
             args=(username,),
-            daemon=True
+            daemon=True,
+            name=f"manual-check-{username}",
         ).start()
+
+    return jsonify({
+        "status": "checks_started",
+        "accounts": USERNAMES,
+    })
+
+
+@app.get("/check_deletions")
+def check_deletions_now():
+
+    if not admin_authorized():
+
+        return "forbidden", 403
+
+    # Trigger deletion checks concurrently.
+    for username in USERNAMES:
 
         threading.Thread(
-            target=deletion_loop,
+            target=check_deletions_for_account,
             args=(username,),
-            daemon=True
+            daemon=True,
+            name=f"manual-delete-{username}",
         ).start()
 
-        log(
-            f"Background workers started for "
-            f"@{username}"
-        )
-
-
-start_background_threads()
+    return jsonify({
+        "status": "deletion_checks_started",
+        "accounts": USERNAMES,
+    })
 
 
 # ============================================================
-# RENDER
+# STARTUP
+# ============================================================
+
+def start_background_workers():
+
+    # One independent worker per TikTok account.
+    for username in USERNAMES:
+
+        threading.Thread(
+            target=account_worker,
+            args=(username,),
+            daemon=True,
+            name=f"account-{username}",
+        ).start()
+
+    # Delivery retry worker.
+    threading.Thread(
+        target=delivery_retry_worker,
+        daemon=True,
+        name="delivery-retry",
+    ).start()
+
+    # Deletion worker.
+    threading.Thread(
+        target=deletion_worker,
+        daemon=True,
+        name="deletion",
+    ).start()
+
+    print(
+        f"[startup] started workers for "
+        f"{len(USERNAMES)} accounts",
+        flush=True,
+    )
+
+
+# ============================================================
+# MAIN
 # ============================================================
 
 if __name__ == "__main__":
 
+    start_background_workers()
+
     port = int(
         os.environ.get(
             "PORT",
-            "10000"
+            "10000",
         )
-    )
-
-    log(
-        f"Starting Flask server on port {port}"
     )
 
     app.run(
         host="0.0.0.0",
-        port=port
+        port=port,
     )
