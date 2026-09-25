@@ -16,8 +16,16 @@ Optional environment variables (change these instead of editing code):
   CHECK_EVERY_SEC     default 60   seconds between checks of each account
   CHECK_BATCH         default 8    how many latest videos to look at per check
   CHECK_CONCURRENCY   default 2    yt-dlp account checks running at once
+  STAGGER_CHECKS      default 1    1 = spread checks across the interval
   BACKGROUND_CONCURRENCY default 1 yt-dlp downloads/deletion checks at once
   FLAT_PLAYLIST       default 0    set to 1 to test a faster listing mode
+  MAX_NEW_VIDEO_AGE_HOURS default 24  never announce a "new" video older than
+                                   this (0 = no limit)
+
+Saved memory (so restarts do not forget anything) - optional, free:
+  UPSTASH_REDIS_REST_URL     from your Upstash database page
+  UPSTASH_REDIS_REST_TOKEN   from your Upstash database page
+  Without these two the bot still works, but forgets everything on restart.
 
 requirements.txt should contain:
   flask
@@ -69,10 +77,20 @@ CHECK_BATCH = env_int("CHECK_BATCH", 8)
 ACCOUNT_CHECK_TIMEOUT_SEC = 120
 USE_FLAT_PLAYLIST = os.environ.get("FLAT_PLAYLIST", "0") == "1"
 
+# 1 (default) = spread the checks evenly across the interval.
+# 0 = all accounts are checked at the same moment each cycle.
+STAGGER_CHECKS = os.environ.get("STAGGER_CHECKS", "1") == "1"
+
 # If one check finds more "new" videos than this, it's almost
 # certainly a backlog, not real fresh posts. Only the newest
 # few are announced; the rest are silently recorded.
 MAX_NEW_ITEMS_PER_CYCLE = 3
+
+# Old videos can suddenly appear in the newest-8 list (creator pins an
+# old video, or deletes a recent one so an older one moves up). They are
+# not new posts, so anything made more than this many hours ago is
+# recorded silently instead of announced. 0 turns the filter off.
+MAX_NEW_VIDEO_AGE_HOURS = env_int("MAX_NEW_VIDEO_AGE_HOURS", 24)
 
 # --- yt-dlp concurrency ---
 # Account checks get their own slots so they never wait behind
@@ -112,6 +130,19 @@ UNKNOWN_FAIL_THRESHOLD = 30
 STATE_DIR = "/tmp/tiktok_bot_state"
 STATE_MAX_ITEMS = 500
 
+# --- Saved memory (Upstash Redis) ---
+# Local files above are the working copy. Changes are copied to
+# Redis every few seconds, and restored from Redis at startup.
+REDIS_URL = os.environ.get("UPSTASH_REDIS_REST_URL", "").strip().rstrip("/")
+REDIS_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "").strip()
+REDIS_ENABLED = bool(REDIS_URL and REDIS_TOKEN)
+REDIS_KEY_PREFIX = os.environ.get("REDIS_KEY_PREFIX", "tiktokbot:state:")
+REDIS_SYNC_EVERY_SEC = env_int("REDIS_SYNC_EVERY_SEC", 10)
+# Routine deletion-check bookkeeping is low priority: it is copied to
+# Redis at most this often per account. Real changes (new video,
+# delivery result, deletion alert) are copied within seconds.
+REDIS_LAZY_SYNC_SEC = env_int("REDIS_LAZY_SYNC_SEC", 1800)
+
 os.makedirs(STATE_DIR, exist_ok=True)
 
 
@@ -146,6 +177,18 @@ DELIVERY_QUEUED_LOCK = threading.Lock()
 
 CHECK_SEMAPHORE = threading.Semaphore(CHECK_CONCURRENCY)
 BACKGROUND_SEMAPHORE = threading.Semaphore(BACKGROUND_CONCURRENCY)
+
+# Saved-memory bookkeeping.
+# STATE_READY: set once restore-from-Redis has finished; workers wait for it.
+# STATE_DIRTY: accounts whose state changed and still needs copying to Redis
+#   (value True = urgent, False = can wait up to REDIS_LAZY_SYNC_SEC).
+# PUSH_BLOCKED: accounts we must NOT write to Redis (restore failed, so we
+#   would risk overwriting good saved data with an empty start).
+STATE_READY = threading.Event()
+STATE_DIRTY = {}   # username -> True if urgent
+LAST_PUSH = {}
+STATE_DIRTY_LOCK = threading.Lock()
+PUSH_BLOCKED = set()
 
 
 # ============================================================
@@ -310,13 +353,14 @@ def _load_state_unlocked(username):
     return migrated
 
 
-def _save_state_unlocked(username, items):
+def _save_state_unlocked(username, items, urgent=True):
     try:
         path = state_file(username)
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(items[-STATE_MAX_ITEMS:], f)
         os.replace(tmp, path)
+        mark_state_dirty(username, urgent)
     except Exception as e:
         print(f"[state] save failed for @{username}: {e}", flush=True)
 
@@ -327,6 +371,203 @@ def get_entry(username, video_id):
             if entry.get("id") == video_id:
                 return dict(entry)
     return None
+
+
+# ============================================================
+# SAVED MEMORY (Upstash Redis) - survives Render restarts
+# ============================================================
+#
+# Uses only a few thousand Redis commands a month (free plan
+# allows 500K). If the two UPSTASH_ variables are not set, all of
+# this is skipped and the bot behaves as before.
+
+def redis_key(username):
+    return f"{REDIS_KEY_PREFIX}{username}"
+
+
+def _redis_headers():
+    return {"Authorization": f"Bearer {REDIS_TOKEN}"}
+
+
+def _redis_check(response):
+    if not response.ok:
+        raise RuntimeError(
+            f"HTTP {response.status_code}: {response.text[:200]}"
+        )
+    return response.json()
+
+
+def redis_command(*args, timeout=8):
+    response = requests.post(
+        REDIS_URL,
+        headers=_redis_headers(),
+        json=list(args),
+        timeout=timeout,
+    )
+    body = _redis_check(response)
+    if isinstance(body, dict) and body.get("error"):
+        raise RuntimeError(body["error"])
+    return body.get("result")
+
+
+def redis_pipeline(commands, timeout=8):
+    response = requests.post(
+        REDIS_URL + "/pipeline",
+        headers=_redis_headers(),
+        json=commands,
+        timeout=timeout,
+    )
+    results = _redis_check(response)
+    for item in results:
+        if isinstance(item, dict) and item.get("error"):
+            raise RuntimeError(item["error"])
+    return [item.get("result") for item in results]
+
+
+def mark_state_dirty(username, urgent=True):
+    if not REDIS_ENABLED:
+        return
+    with STATE_DIRTY_LOCK:
+        STATE_DIRTY[username] = STATE_DIRTY.get(username, False) or urgent
+
+
+def _write_state_text(username, text):
+    path = state_file(username)
+    tmp = path + ".restore.tmp"
+    with STATE_LOCKS[username]:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+
+
+def restore_state_from_redis():
+    """
+    Runs once at startup, before any checking begins. For every
+    account with no local state file, loads the saved copy from
+    Redis. Returns a one-line summary for the startup message.
+    """
+    if not REDIS_ENABLED:
+        return "💾 Saved memory: OFF (a restart forgets everything)"
+
+    needed = [u for u in USERNAMES if not os.path.exists(state_file(u))]
+
+    if not needed:
+        return "💾 Saved memory: on (kept the local copy)"
+
+    values = None
+
+    for attempt in range(1, 4):
+        try:
+            values = redis_command("MGET", *[redis_key(u) for u in needed])
+            break
+        except Exception as e:
+            print(f"[memory] restore attempt {attempt}/3 failed: {e}",
+                  flush=True)
+            time.sleep(2 * attempt)
+
+    if not isinstance(values, list):
+        # Couldn't read the saved copy. Run without it, and do NOT
+        # write to Redis, or a fresh empty start could overwrite it.
+        PUSH_BLOCKED.update(needed)
+        return ("⚠️ Saved memory: couldn't reach Upstash. Running without "
+                "it until the next restart")
+
+    restored_accounts = 0
+    restored_videos = 0
+
+    for username, text in zip(needed, values):
+        if not text:
+            continue
+
+        try:
+            data = json.loads(text)
+            if not isinstance(data, list):
+                raise ValueError("not a list")
+        except Exception as e:
+            PUSH_BLOCKED.add(username)
+            print(f"[memory] @{username}: saved data unreadable ({e}); "
+                  f"leaving it alone", flush=True)
+            continue
+
+        _write_state_text(username, text)
+        restored_accounts += 1
+        restored_videos += len(data)
+
+        print(f"[memory] @{username}: restored {len(data)} videos",
+              flush=True)
+
+    if restored_accounts == 0:
+        return "💾 Saved memory: on (nothing saved yet, starting fresh)"
+
+    return (f"💾 Saved memory: restored {restored_videos} videos "
+            f"for {restored_accounts} accounts")
+
+
+def sync_dirty_states():
+    """Copies every changed account's state to Redis in one request."""
+    if not REDIS_ENABLED:
+        return
+
+    now = time.time()
+    pending = []
+
+    with STATE_DIRTY_LOCK:
+        for username, urgent in list(STATE_DIRTY.items()):
+            if username in PUSH_BLOCKED:
+                del STATE_DIRTY[username]
+                continue
+
+            due = now - LAST_PUSH.get(username, 0) >= REDIS_LAZY_SYNC_SEC
+
+            if urgent or due:
+                pending.append(username)
+                del STATE_DIRTY[username]
+
+    if not pending:
+        return
+
+    commands = []
+    included = []
+
+    for username in pending:
+        try:
+            with STATE_LOCKS[username]:
+                with open(state_file(username), "r", encoding="utf-8") as f:
+                    text = f.read()
+        except Exception as e:
+            print(f"[memory] @{username}: couldn't read state to save: {e}",
+                  flush=True)
+            continue
+
+        commands.append(["SET", redis_key(username), text])
+        included.append(username)
+
+    if not commands:
+        return
+
+    try:
+        redis_pipeline(commands)
+    except Exception as e:
+        print(f"[memory] save failed: {e}; will retry", flush=True)
+        with STATE_DIRTY_LOCK:
+            for username in included:
+                STATE_DIRTY[username] = True
+        return
+
+    for username in included:
+        LAST_PUSH[username] = time.time()
+
+
+def state_sync_worker():
+    STATE_READY.wait()
+
+    while True:
+        time.sleep(REDIS_SYNC_EVERY_SEC)
+
+        try:
+            sync_dirty_states()
+        except Exception as e:
+            print(f"[memory] sync error: {e}", flush=True)
 
 
 # ============================================================
@@ -763,6 +1004,26 @@ def delivery_job(username, video_id):
             DELIVERY_QUEUED.discard(key)
 
 
+def video_age_hours(video_id):
+    """
+    TikTok video IDs start with the creation time (unix seconds) in
+    their top 32 bits. Returns the video's age in hours, or None if
+    it can't be worked out (then the video is treated as new).
+    """
+    try:
+        created = int(video_id) >> 32
+    except (TypeError, ValueError):
+        return None
+
+    now = time.time()
+
+    # Sanity check: after 2016 and not in the future.
+    if created < 1451606400 or created > now + 86400:
+        return None
+
+    return (now - created) / 3600
+
+
 # ============================================================
 # NORMAL ACCOUNT CHECK
 # ============================================================
@@ -810,6 +1071,40 @@ def process_account(username):
             known = {str(e.get("id")) for e in state if e.get("id")}
 
             new_items = [i for i in items if i["id"] not in known]
+
+            # Old-video guard: something made days ago that just showed
+            # up in the list (pinned, or moved up after a deletion) is
+            # not a new post. Record it silently.
+            if MAX_NEW_VIDEO_AGE_HOURS > 0 and new_items:
+                fresh = []
+                stale = []
+
+                for item in new_items:
+                    age = video_age_hours(item["id"])
+
+                    if age is not None and age > MAX_NEW_VIDEO_AGE_HOURS:
+                        stale.append((item, age))
+                    else:
+                        fresh.append(item)
+
+                if stale:
+                    now = time.time()
+
+                    for item, age in stale:
+                        print(f"[new] @{username} {item['id']}: made "
+                              f"{age / 24:.1f} days ago, not a new post; "
+                              f"recorded silently", flush=True)
+
+                        state.append(make_entry(
+                            item["id"], item["url"], item["title"],
+                            video_sent=True,
+                            last_delete_check=now,
+                            announced=False,
+                        ))
+
+                    _save_state_unlocked(username, state)
+
+                new_items = fresh
 
             # Backlog guard: announce only the newest few.
             if len(new_items) > MAX_NEW_ITEMS_PER_CYCLE:
@@ -925,7 +1220,9 @@ def check_deletions_for_account(username):
                         alert = apply_deletion_result(
                             entry, result, username
                         )
-                        _save_state_unlocked(username, state)
+                        _save_state_unlocked(
+                            username, state, urgent=bool(alert)
+                        )
                         break
 
             if alert:
@@ -943,6 +1240,8 @@ def check_deletions_for_account(username):
 # ============================================================
 
 def delivery_retry_worker():
+    STATE_READY.wait()
+
     while True:
         try:
             now = time.time()
@@ -970,6 +1269,8 @@ def delivery_retry_worker():
 
 
 def deletion_worker():
+    STATE_READY.wait()
+
     # Let startup settle before the first sweep.
     time.sleep(DELETE_CHECK_EVERY_SEC)
 
@@ -989,11 +1290,15 @@ def deletion_worker():
 def account_worker(username):
     print(f"[worker] started for @{username}", flush=True)
 
-    # Spread the accounts evenly across the check interval so they
-    # don't all queue for yt-dlp at the same moment.
-    time.sleep(
-        USERNAMES.index(username) * CHECK_EVERY_SEC / len(USERNAMES)
-    )
+    # Don't check anything until saved state has been restored.
+    STATE_READY.wait()
+
+    # Optional: spread accounts across the interval (STAGGER_CHECKS=1).
+    # Default is off, so all accounts are checked at the same moment.
+    if STAGGER_CHECKS:
+        time.sleep(
+            USERNAMES.index(username) * CHECK_EVERY_SEC / len(USERNAMES)
+        )
 
     next_check = time.time()
 
@@ -1035,7 +1340,11 @@ def health():
 
 @app.get("/health")
 def health_check():
-    return jsonify({"status": "ok", "accounts": USERNAMES})
+    return jsonify({
+        "status": "ok",
+        "accounts": USERNAMES,
+        "saved_memory": "on" if REDIS_ENABLED else "off",
+    })
 
 
 @app.get("/debug_check_speed")
@@ -1124,6 +1433,24 @@ def check_deletions_now():
 # STARTUP
 # ============================================================
 
+def startup_sequence():
+    try:
+        summary = restore_state_from_redis()
+    except Exception as e:
+        PUSH_BLOCKED.update(USERNAMES)
+        summary = "⚠️ Saved memory: restore failed, running without it"
+        print(f"[memory] restore error: {e}", flush=True)
+
+    STATE_READY.set()
+
+    print(f"[memory] {summary}", flush=True)
+
+    tg_send_text(
+        f"👋 Bot online. Watching: "
+        f"{', '.join('@' + u for u in USERNAMES)}\n{summary}"
+    )
+
+
 def start_background_workers():
     for username in USERNAMES:
         threading.Thread(
@@ -1141,12 +1468,15 @@ def start_background_workers():
         target=deletion_worker, daemon=True, name="deletion"
     ).start()
 
-    # One line so you can tell when the bot (re)started.
+    # Copies changed state to Redis every few seconds.
     threading.Thread(
-        target=tg_send_text,
-        args=(f"👋 Bot online. Watching: "
-              f"{', '.join('@' + u for u in USERNAMES)}",),
-        daemon=True,
+        target=state_sync_worker, daemon=True, name="state-sync"
+    ).start()
+
+    # Restore saved state first, then let the workers start, then
+    # send one line so you can tell when the bot (re)started.
+    threading.Thread(
+        target=startup_sequence, daemon=True, name="startup"
     ).start()
 
     print(f"[startup] started workers for {len(USERNAMES)} accounts",
@@ -1158,4 +1488,9 @@ if __name__ == "__main__":
 
     port = int(os.environ.get("PORT", "10000"))
 
-    app.run(host="0.0.0.0", port=port)
+    # threaded=True: without it, Flask's dev server handles one HTTP
+    # request at a time. A slow request (e.g. /debug_check_speed with
+    # no &account=, which checks all 7 accounts one by one) would
+    # otherwise block the health-check ping and could make Render's
+    # proxy think the service is down.
+    app.run(host="0.0.0.0", port=port, threaded=True)
